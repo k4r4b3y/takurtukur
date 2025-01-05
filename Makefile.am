@@ -1,4 +1,6 @@
-moddir=$(prefix)/share/guile/site
+AUTOMAKE_OPTIONS = foreign
+
+moddir = $(prefix)/share/guile/site
 
 SOURCES =					\
 	tekuti/base64.scm			\
