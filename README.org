@@ -1,0 +1,54 @@
+The documentation of tekuti is *very* poor to nonexistent.  The [[https://wingolog.org/projects/tekuti/][only
+docs]] we have doesn't even work out of the box, and you have to make
+some changes to the codebase to get it off the ground.
+
+* Learnings
+
+** 1. You *must* have a git user config ready
+
+In my /WhonixOS/ settings, the global git config is empty.  /Tekuti/
+relies on an existing `git user.name` and `git user.email` string
+values for bootstrapping the initial bare repo.  Without these config
+variables, it fails, and throws out some error.
+
+Make sure you have a the following git global configs set to some
+bogus values:
+
+#+begin_src shell
+git config --global user.name 'user'
+git config --gloabl user.email 'user@host.localdomain'
+#+end_src
+
+** 2. Fix the git.scm for initializing the blog
+
+See [[https://github.com/wingo/tekuti/issues/4#issuecomment-2455669169][this]] github issue comment.
+
+#+begin_src diff
+diff --git a/tekuti/util.scm b/tekuti/util.scm
+index 2a6d6fb..46fdec0 100644
+--- a/tekuti/util.scm
++++ b/tekuti/util.scm
+@@ -160,7 +160,7 @@
+ 
+ (define (filter-mapn proc l nmax)
+   (let lp ((in l) (out '()) (n nmax))
+-    (if (or (null? in) (zero? n))
++    (if (or (nil? in) (zero? n))
+         (reverse out)
+         (let ((val (proc (car in))))
+           (if val
+#+end_src
+
+After making this change, restart the =./env src/tekuti= command.  And
+visit the =127.0.0.1:8080=.  You will see your local tekuti blog.
+
+Once you have a content available, you can revert that line to its
+previous state.  It seems to work.
+
+** 3. I don't know why but there is a typo in the git.scm file
+
+It uses a string as ="GIT_COMMMITTER=tekuti"=.  I have no idea why
+this thing has 3 =M='s.  It looks like a typo, it should be a typo,
+and if it's not a typo, the dude should've simply left a comment in
+there saying, "triple-M is intentional".  I fixed every occurrence of
+triple-M typo to its proper double-M versions.
