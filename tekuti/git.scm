@@ -212,10 +212,12 @@
                 (if parent (list "-p" parent) '()))
          #:input message
          #:env (if timestamp
-                   (list "GIT_COMMITTER=tekuti"
+                   (list "GIT_COMMITTER_NAME=tekuti"
+                         "GIT_COMMITTER_EMAIL=tekuti@example.com"
                          (format #f "GIT_COMMITTER_DATE=~a +0100" timestamp)
                          (format #f "GIT_AUTHOR_DATE=~a +0100" timestamp))
-                   (list "GIT_COMMITTER=tekuti")))))
+                   (list "GIT_COMMITTER_NAME=tekuti"
+                         "GIT_COMMITTER_EMAIL=tekuti@example.com")))))
 
 ;;;
 ;;; utilities
