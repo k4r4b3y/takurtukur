@@ -267,7 +267,14 @@ Tekuti's codebase consists of 20 guile scheme files:
     (if (option-ref opts 'listen #f)
         ((@ (system repl server) spawn-server)))
     opts))
+#+end_src
 
+*** boot
+
+Ensures that there is a bare git repo for the user's Tekuti blog.  And
+gets the prgoram enter its [[main-loop]].
+
+#+begin_src scheme :tangle ./tekuti/boot.scm :mkdirp yes
 (define (boot args)
   (setlocale LC_ALL "")
   (let ((options (parse-options args)))
@@ -1297,6 +1304,8 @@ Tekuti's codebase consists of 20 guile scheme files:
 ;;; Code:
 #+end_src
 
+*** funcs
+
 #+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
 (define-module (tekuti git)
   #:use-module (ice-9 rdelim)
@@ -1392,7 +1401,13 @@ Tekuti's codebase consists of 20 guile scheme files:
   (catch 'system-error
          (lambda () (eq? (stat:type (stat path)) 'directory))
          (lambda args #f)))
+#+end_src
 
+*** ensure-git-repo
+
+This function gets called from [[boot]] function in the [[boot.scm]] file.
+
+#+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
 (define (ensure-git-repo)
   (let ((d (expanduser *git-dir*)))
     (if (not (is-dir? d))
@@ -1404,7 +1419,11 @@ Tekuti's codebase consists of 20 guile scheme files:
                (git-commit-tree (string-trim-both (git* '("mktree") #:input ""))
                                 #f "initial commit" #f))) ;TODO: git-commit-tree is the source of the error
         (chdir d))))
+#+end_src
 
+*** rest
+
+#+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
 (define (git-ls-tree treeish path)
   (or (and treeish
            (false-if-git-error
@@ -1479,7 +1498,16 @@ Tekuti's codebase consists of 20 guile scheme files:
      (else
       (pk "failed to update the ref, trying again..." refname)
       (git-update-ref refname proc (1- count))))))
+#+end_src
 
+*** git-commit-tree
+
+Creates a git commit object out of the given git tree.  The
+[[ensure-git-repo]] function calls this function with a tree object
+created from the empty string =""= when Tekuti creates the bare repo
+(by default in =~/blog.git=) for the first time.
+
+#+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
 (define (git-commit-tree tree parent message timestamp)
   (string-trim-both
    (git* (cons* "commit-tree" tree
@@ -1496,7 +1524,11 @@ Tekuti's codebase consists of 20 guile scheme files:
                          "GIT_COMMITTER_EMAIL=tekuti@example.com"
                          "GIT_AUTHOR_NAME=tekuti"
                          "GIT_AUTHOR_EMAIL=tekuti@example.com")))))
+#+end_src
 
+*** rest
+
+#+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
 ;;;
 ;;; utilities
 ;;;
@@ -5345,7 +5377,11 @@ present."
             (lambda (response body)
               (let ((index (cache-set index request response body)))
                 (values response body index))))))))))
+#+end_src
 
+*** main-loop
+
+#+begin_src scheme :tangle ./tekuti/web.scm :mkdirp yes
 ;; The seemingly useless lambda is to allow for `handler' to be
 ;; redefined at runtime.
 (define (main-loop)
