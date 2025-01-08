@@ -42,6 +42,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** base64.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/base64.scm :mkdirp yes
 ;; Tekuti
@@ -191,6 +192,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** boot.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/boot.scm :mkdirp yes
 ;; Tekuti
@@ -283,6 +285,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** cache.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/cache.scm :mkdirp yes
 ;; Tekuti
@@ -424,6 +427,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** classifier.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/classifier.scm :mkdirp yes
 ;; Tekuti
@@ -747,6 +751,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** comment.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/comment.scm :mkdirp yes
 ;; Tekuti
@@ -985,6 +990,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** config.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/config.scm :mkdirp yes
 ;; Tekuti
@@ -1064,6 +1070,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** filters.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/filters.scm :mkdirp yes
 ;; Tekuti
@@ -1260,6 +1267,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** git.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
 ;; Tekuti
@@ -1636,6 +1644,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** index.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/index.scm :mkdirp yes
 ;; Tekuti
@@ -1769,6 +1778,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** marxdown.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/marxdown.scm :mkdirp yes
 ;; Tekuti
@@ -2639,6 +2649,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 
 ** match-bind.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/match-bind.scm :mkdirp yes
 ;; (match-bind) -- binding variables from regular expression matches
@@ -2912,6 +2923,7 @@ and replace, not stopping at the first match.
 
 ** mod-lisp.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/mod-lisp.scm :mkdirp yes
 ;; Tekuti
@@ -3159,6 +3171,7 @@ and replace, not stopping at the first match.
 
 ** page.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/page.scm :mkdirp yes
 ;; Tekuti
@@ -3629,6 +3642,7 @@ and replace, not stopping at the first match.
 
 ** page-helpers.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/page-helpers.scm :mkdirp yes
 ;; Tekuti
@@ -4274,6 +4288,7 @@ present."
 
 ** post.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/post.scm :mkdirp yes
 ;; Tekuti
@@ -4585,6 +4600,7 @@ present."
 
 ** request.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/request.scm :mkdirp yes
 ;; Tekuti
@@ -4769,6 +4785,7 @@ present."
 
 ** tags.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/tags.scm :mkdirp yes
 ;; Tekuti
@@ -4878,7 +4895,8 @@ present."
 
 ** template.scm
 
-#+preamble
+*Preamble:*
+#+name: preamble
 #+begin_src scheme :tangle ./tekuti/template.scm :mkdirp yes
 ;; Tekuti
 ;; Copyright (C) 2008, 2010, 2012, 2023 Andy Wingo <wingo at pobox dot com>
@@ -4963,6 +4981,7 @@ present."
 
 ** util.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/util.scm :mkdirp yes
 ;; Tekuti
@@ -5230,6 +5249,7 @@ present."
 
 ** web.scm
 
+*Preamble:*
 #+name: preamble
 #+begin_src scheme :tangle ./tekuti/web.scm :mkdirp yes
 ;; Tekuti
@@ -5334,7 +5354,7 @@ present."
 
 #+end_src
 
-* Closing: some notes on tekut's quirks
+* Closing: some notes on Tekuti's quirks
 
 ** 1. You *must* have a git user config ready
 
