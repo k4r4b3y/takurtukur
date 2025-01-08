@@ -1,8 +1,5340 @@
+#+title: Tekuti Literate Programming Documentation
+#+description: Documentation and source code for the Tekuti blogging engine
+
+* Introduction
+
 The documentation of tekuti is *very* poor to nonexistent.  The [[https://wingolog.org/projects/tekuti/][only
 docs]] we have doesn't even work out of the box, and you have to make
 some changes to the codebase to get it off the ground.
 
-* Learnings
+In this literate programming document, I will be trying to get a sense
+of the tekuti codebase and document my own undertanding.  I am also
+planning to make small bugfixes (if I can) to the bugs I am frequently
+getting with tekuti.
+
+* Codebase
+
+Tekuti's codebase consists of 20 guile scheme files:
+
+#+name: Scheme files in the Tekuti codebase
+| Filename         | LOC | Short description |
+|------------------+-----+-------------------|
+| base64.scm       | 141 | n/a               |
+| boot.scm         |  83 | n/a               |
+| cache.scm        | 132 | n/a               |
+| classifier.scm   | 314 | n/a               |
+| comment.scm      | 230 | n/a               |
+| config.scm       |  71 | n/a               |
+| filters.scm      | 190 | n/a               |
+| git.scm          | 367 | n/a               |
+| index.scm        | 125 | n/a               |
+| marxdown.scm     | 862 | n/a               |
+| match-bind.scm   | 264 | n/a               |
+| mod-lisp.scm     | 238 | n/a               |
+| page.scm         | 461 | n/a               |
+| page-helpers.scm | 636 | n/a               |
+| post.scm         | 302 | n/a               |
+| request.scm      | 175 | n/a               |
+| tags.scm         | 100 | n/a               |
+| template.scm     |  76 | n/a               |
+| util.scm         | 259 | n/a               |
+| web.scm          |  97 | n/a               |
+
+** base64.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/base64.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012, 2023 Andy Wingo <wingo at pobox dot com>
+;; Copyright (C) 2009 Andreas Rottmann <a dot rottmann at gmx dot at>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; base 64 y'all
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/base64.scm :mkdirp yes
+(define-module (tekuti base64)
+  #:use-module (rnrs bytevectors)
+  #:export (base64-encode base64-decode))
+
+(define b64-bytes
+  (string->utf8
+   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"))
+
+(define (int->b64-byte i)
+  (bytevector-u8-ref b64-bytes (logand i 63)))
+
+(define b64-byte-ranges
+  (map cons
+       (map char->integer '(#\A #\a #\0 #\+ #\/))
+       (map char->integer '(#\Z #\z #\9 #\+ #\/))))
+
+(define (b64-byte->int i)
+  (let lp ((ranges b64-byte-ranges) (out 0))
+    (cond ((null? ranges)
+           (error "bad base64 byte" i))
+          ((and (>= i (caar ranges)) (<= i (cdar ranges)))
+           (+ out (- i (caar ranges))))
+          (else
+           (lp (cdr ranges) (+ out (+ 1 (- (cdar ranges)
+                                           (caar ranges)))))))))
+
+(define (bytevector-pad bv n fill)
+  (let ((result (make-bytevector n fill)))
+    (bytevector-copy! bv 0 result 0 (bytevector-length bv))
+    result))
+
+(define-syntax bytevector-map-n-to-m
+  (lambda (stx)
+    (syntax-case stx ()
+      ((_ n m)
+       (with-syntax (((byte-in ...)
+                      (map (lambda (x)
+                             #`(bytevector-u8-ref s (+ i #,x)))
+                           (iota (syntax->datum #'n))))
+                     ((byte-out ...)
+                      (generate-temporaries (iota (syntax->datum #'m))))
+                     ((byte-out-idx ...)
+                      (iota (syntax->datum #'m))))
+         #'(lambda (proc s)
+             (let* ((len (bytevector-length s))
+                    (out (make-bytevector (* len (/ m n)))))
+               (let lp ((i 0) (j 0))
+                 (cond
+                  ((< i len)
+                   (call-with-values (lambda () (proc byte-in ...))
+                     (lambda (byte-out ...)
+                       (bytevector-u8-set! out (+ j byte-out-idx) byte-out)
+                       ...))
+                   (lp (+ i n) (+ j m)))
+                  (else out))))))))))
+
+(define (bytevector-fill-range! bv start end u8)
+  (do ((i (- end 1) (- i 1)))
+      ((< i start))
+      (bytevector-u8-set! bv i u8)))
+
+(define (bytevector-copy/padding bv npad pad-byte)
+  (let ((result (bytevector-copy bv))
+        (len (bytevector-length bv)))
+    (bytevector-fill-range! result (- len npad) len pad-byte)
+    result))
+
+(define (base64-encode bv)
+  (let* ((npad (remainder (- 3 (remainder (bytevector-length bv) 3)) 3))
+         (out ((bytevector-map-n-to-m 3 4)
+               (lambda (x y z)
+                 (let ((n (logior (ash x 16) (ash y 8) z)))
+                   (values (int->b64-byte (ash n -18))
+                           (int->b64-byte (ash n -12))
+                           (int->b64-byte (ash n -6))
+                           (int->b64-byte n))))
+               (bytevector-pad bv (+ (bytevector-length bv) npad) 0))))
+    (bytevector-fill-range! out
+                            (- (bytevector-length out) npad)
+                            (bytevector-length out)
+                            (char->integer #\=))
+    (utf8->string out)))
+
+(define eql-byte (char->integer #\=))
+
+(define (b64-bv-npad bv)
+  (let ((len (bytevector-length bv)))
+    (if (> len 0)
+        (if (= (bytevector-u8-ref bv (- len 1)) eql-byte)
+            (if (> len 1)
+                (if (= (bytevector-u8-ref bv (- len 2)) eql-byte)
+                    2
+                    1)
+                1)
+            0)
+        0)))
+
+(define (base64-decode str)
+  (let* ((bv (string->utf8 str))
+         (npad (b64-bv-npad bv))
+         (out ((bytevector-map-n-to-m 4 3)
+               (lambda (w x y z)
+                 (let ((n (logior (ash (b64-byte->int w) 18)
+                                  (ash (b64-byte->int x) 12)
+                                  (ash (b64-byte->int y) 6)
+                                  (b64-byte->int z))))
+                   (values (ash n -16)
+                           (logand (ash n -8) 255)
+                           (logand n 255))))
+               (bytevector-copy/padding bv npad (char->integer #\A))))
+         (result (make-bytevector (- (bytevector-length out) npad))))
+    (bytevector-copy! out 0 result 0 (bytevector-length result))
+    result))
+
+#+end_src
+
+** boot.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/boot.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Module to parse options, etc before dropping into the main loop.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/boot.scm :mkdirp yes
+;;hack!
+
+(define-module (tekuti boot)
+  #:use-module (ice-9 format)
+  #:use-module (ice-9 getopt-long)
+  #:use-module (tekuti git)
+  #:use-module (tekuti web)
+  #:export (boot))
+
+(define *option-grammar* '((listen)
+                           (usage)
+                           (config (value #t) (single-char #\c))
+                           (version (single-char #\v))
+                           (help (single-char #\h))))
+
+(define (usage)
+  ;; trying out `format'. mixed results.
+  (define (repr-option opt)
+    (let ((required (and=> (assq 'required (cdr opt)) cadr)))
+      (format #f "~:[[~;~]--~a~@*~:[]~;~]"
+              (assq 'required? (cdr opt)) (car opt))))
+
+  (format #t "usage: tekuti ~{~a~^ ~}~%"
+          (map repr-option *option-grammar*)))
+
+(define (version)
+  (format #t "tekuti version 0.1"))
+
+;; krap code
+(define (parse-options args)
+  (let ((opts (getopt-long args *option-grammar*)))
+    (if (or (option-ref opts 'usage #f)
+            (option-ref opts 'help #f)
+            (not (null? (option-ref (cdr opts) '() '()))))
+        (begin
+          (usage)
+          (exit 0)))
+    (if (option-ref opts 'version #f)
+        (begin
+          (version)
+          (exit 0)))
+    (if (option-ref opts 'listen #f)
+        ((@ (system repl server) spawn-server)))
+    opts))
+
+(define (boot args)
+  (setlocale LC_ALL "")
+  (let ((options (parse-options args)))
+    (let ((config (option-ref options 'config #f)))
+      (if config
+          (let ((config-module (resolve-module '(tekuti config))))
+            (save-module-excursion
+             (lambda ()
+               (set-current-module config-module)
+               (primitive-load config))))))
+    (ensure-git-repo)
+    (main-loop)))
+
+#+end_src
+
+** cache.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/cache.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2010, 2012 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; A simple response cache.  The model is that all request-response
+;; pairs that the cache sees are fresh and valid.  The application can
+;; invalidate the cache simply by creating a new empty cache.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/cache.scm :mkdirp yes
+(define-module (tekuti cache)
+  #:use-module (tekuti util)
+  #:use-module (web request)
+  #:use-module (web response)
+  #:use-module (srfi srfi-19)
+  #:export (make-empty-cache
+            cached-response-and-body
+            update-cache))
+
+(define (cacheable-request? request)
+  (and (memq (request-method request) '(GET HEAD))
+       (not (request-authorization request))
+       ;; We don't cache these conditional requests; just
+       ;; if-modified-since and if-none-match.
+       (not (request-if-match request))
+       (not (request-if-range request))
+       (not (request-if-unmodified-since request))))
+
+(define (cacheable-response? response)
+  (and (not (memq 'no-cache (response-pragma response)))
+       (not (member '(no-cache . #t) (response-cache-control response)))
+       (memq (response-code response) '(200 301 304 404 410))
+       (null? (response-vary response))))
+
+(define (make-empty-cache)
+  '())
+
+(define-syntax build-headers
+  (syntax-rules ()
+    ((_ k v-exp rest ...)
+     (let ((v v-exp))
+       (let ((tail (build-headers rest ...)))
+         (if v
+             (acons 'k v tail)
+             tail))))
+    ((_ tail)
+     tail)))
+
+(define (make-entry request response body)
+  (let ((uri (request-uri request))
+        (method (request-method request)))
+    (case (response-code response)
+      ((304)
+       (lambda (request)
+         (and (equal? (request-uri request) uri)
+              (eq? (request-method request) method)
+              (let ((request-etags (request-if-none-match request))
+                    (since (request-if-modified-since request)))
+                (and
+                 ;; Only return a 304 if the request is conditional.
+                 (or request-etags since)
+                 ;; If the request specifies an etag set, honor it.
+                 (or (not request-etags)
+                     (and (list? request-etags)
+                          (member (response-etag response) request-etags)))
+                 ;; Likewise for if-modified-since.
+                 (or (not since)
+                     (let ((last-modified (response-last-modified response)))
+                       (and last-modified
+                            (time<=? (date->time-utc last-modified)
+                                     (date->time-utc since)))))))
+              (cons response body))))
+      ((200)
+       (lambda (request)
+         (and (equal? (request-uri request) uri)
+              (eq? (request-method request) method)
+              (or (let ((last-modified (response-last-modified response))
+                        (since (request-if-modified-since request))
+                        (etag (response-etag response))
+                        (match (request-if-none-match request)))
+                    (and (or since match)
+                         (or (not since)
+                             (and last-modified
+                                  (time<=? (date->time-utc last-modified)
+                                           (date->time-utc since))))
+                         (or (not match)
+                             (and etag (list? match) (member etag match)))
+                         (cons (build-response
+                                #:code 304
+                                #:headers (build-headers
+                                           etag etag
+                                           last-modified last-modified
+                                           date (current-date)
+                                           '()))
+                               #f)))
+                  (cons response body)))))
+      (else
+       (lambda (request)
+         (and (equal? (request-uri request) uri)
+              (eq? (request-method request) method)
+              (cons response body)))))))
+
+(define (cached-response-and-body cache request)
+  (and cache
+       (cacheable-request? request)
+       (or-map (lambda (entry) (entry request))
+               cache)))
+
+(define (update-cache cache request response body)
+  (if (and (cacheable-request? request)
+           (cacheable-response? response))
+      (cons (make-entry request response body)
+            (take-max (or cache '()) 19))
+      (or cache '())))
+
+#+end_src
+
+** classifier.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/classifier.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012, 2022 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Comments -- pulling them out of the database, and making new ones.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/classifier.scm :mkdirp yes
+(define-module (tekuti classifier)
+  #:use-module (tekuti comment)
+  #:use-module (tekuti filters)
+  #:use-module (tekuti git)
+  #:use-module (tekuti util)
+  #:use-module (ice-9 match)
+  #:use-module (srfi srfi-11)
+  #:use-module (srfi srfi-9)
+  #:export (reindex-legit-comments
+            reindex-bogus-comments
+            reindex-classifier
+            comment-is-bogus?))
+
+(define (tokenize-comment comment)
+  (define (decorate-tokens decorator tokens)
+    (map (lambda (token) (string-append decorator token)) tokens))
+  (define (tokenize exp)
+    (match exp
+      ((or () #f) '())
+      ((? string?) (string-tokenize exp char-set:letter+digit))
+      (((or 'comment 'div 'p) . body)
+       (tokenize body))
+      (((? symbol? tag) . body)
+       (decorate-tokens (string-append (symbol->string tag) ".")
+                        (tokenize body)))
+      ((head . tail) (append (tokenize head) (tokenize tail)))
+      (_ (pk 'what exp comment) '())))
+  (tokenize
+   `(comment
+     (author ,(assq-ref comment 'author))
+     (email ,(assq-ref comment 'author_email))
+     (url ,(assq-ref comment 'author_url))
+     ,(let ((format (or (assq-ref comment 'format) 'wordpress))
+            (raw (assq-ref comment 'raw-content)))
+        (or (case format
+              ((wordpress) (false-if-exception (wordpress->sxml raw)))
+              ((marxdown) (false-if-exception (marxdown->sxml raw)))
+              (else `(pre ,raw)))
+            `(pre ,raw))))))
+
+(define (fold-features comment f seed)
+  (let lp ((tokens (tokenize-comment comment)) (seed seed))
+    (define (make-3-gram a b c)
+      (string-append a " " (or b "") " " (or c "")))
+    (define (make-2-gram a b)
+      (string-append a " " (or b "")))
+    (define (make-1-gram a)
+      a)
+    (match tokens
+      ((a . tokens)
+       (lp tokens
+           (or (f (match tokens
+                    ((b c . _) (make-3-gram a b c))
+                    ((b) (make-3-gram a b #f))
+                    (() (make-3-gram a #f #f)))
+                  (or (f (match tokens
+                           ((b . _) (make-2-gram a b))
+                           (() (make-2-gram a #f)))
+                         (f (make-1-gram a)
+                            seed))
+                      seed))
+               (f (make-1-gram a)
+                  seed))))
+      (() seed))))
+
+(define (count-features comments)
+  (let ((counts (make-hash-table)))
+    (hash-for-each
+     (lambda (comment-sha1 comment-name)
+       (fold-features (blob->comment comment-name comment-sha1)
+                      (lambda (feature counts)
+                        (add-feature! counts feature)
+                        counts)
+                      counts))
+     comments)
+    counts))
+
+;; A feature's bogosity is the probability that a bogus document
+;; contains that feature, divided by the probability that a legit
+;; document contains the feature.
+(define (compute-log-bogosities legit-features bogus-features)
+  (define (feature-count table)
+    (hash-fold (lambda (feature count sum) (+ count sum)) 0 table))
+  (let ((total-bogus-features (feature-count bogus-features))
+        (total-legit-features (feature-count legit-features))
+        (log-bogosities (make-hash-table)))
+    (hash-for-each
+     (lambda (feature bogus-count)
+       (let ((legit-count (hash-ref legit-features feature 0)))
+         (hash-set! log-bogosities feature
+                    (log (/ (/ (+ bogus-count 0.001) total-bogus-features)
+                            (/ (+ legit-count 0.001) total-legit-features))))))
+     bogus-features)
+    (hash-for-each
+     (lambda (feature legit-count)
+       (let ((bogus-count (hash-ref bogus-features feature)))
+         (unless bogus-count
+           (hash-set! log-bogosities feature
+                      (log (/ (/ 0.01 total-bogus-features)
+                              (/ (+ legit-count 0.01) total-legit-features)))))))
+     legit-features)
+    log-bogosities))
+
+(define (update-bogosities! log-bogosities changed-features
+                            legit-features bogus-features)
+  (define (feature-count table)
+    (hash-fold (lambda (feature count sum) (+ count sum)) 0 table))
+  (let ((total-bogus-features (feature-count bogus-features))
+        (total-legit-features (feature-count legit-features)))
+    (hash-for-each
+     (lambda (feature _)
+       (let ((bogus-count (hash-ref bogus-features feature))
+             (legit-count (hash-ref legit-features feature 0)))
+	 (cond
+	  (bogus-count
+           (hash-set! log-bogosities feature
+                      (log (/ (/ (+ bogus-count 0.001) total-bogus-features)
+			      (/ (+ legit-count 0.001) total-legit-features)))))
+          (else
+	   (hash-set! log-bogosities feature
+                      (log (/ (/ 0.01 total-bogus-features)
+                              (/ (+ legit-count 0.01) total-legit-features))))))))
+     changed-features)))
+
+(define (compute-bogus-probability comment log-bogosities bogus-prior
+                                   feature-limit)
+  (let ((v (make-vector feature-limit 0.0)))
+    (define (add-bogosity! log-bogosity)
+      (let ((mag (abs log-bogosity)))
+        (when (< (abs (vector-ref v 0)) mag)
+          (let lp ((idx 0))
+            (let ((next (1+ idx)))
+              (cond
+               ((and (< next (vector-length v))
+                     (< (abs (vector-ref v next)) mag))
+                (vector-set! v idx (vector-ref v next))
+                (lp (1+ idx)))
+               (else
+                (vector-set! v idx log-bogosity))))))))
+    (fold-features comment
+                   (lambda (feature _)
+                     (add-bogosity! (hash-ref log-bogosities feature 0.0)))
+                   #f)
+    (let* ((ratio (exp (+ (log (/ bogus-prior (- 1.0 bogus-prior)))
+                          (apply + (vector->list v))))))
+      (/ ratio (+ ratio 1.0)))))
+
+(define (compute-differing-comments old-master new-master)
+  ;; sha1 -> name
+  (define (compute-hash-diff old new)
+    (let ((removed (make-hash-table))
+          (added (make-hash-table)))
+      (hash-for-each (lambda (post-sha1 post-name)
+                       (unless (hash-ref new post-sha1)
+                         (hash-set! removed post-sha1 post-name)))
+                     old)
+      (hash-for-each (lambda (post-sha1 post-name)
+                       (unless (hash-ref old post-sha1)
+                         (hash-set! added post-sha1 post-name)))
+                     new)
+      (values removed added)))
+  (define* (git-ls-tree->hash ref kind #:optional (out (make-hash-table)))
+    (for-each
+     (match-lambda
+       ((name sha1 (? (lambda (x) (eq? x kind))))
+        (hash-set! out sha1 name)))
+     (git-ls-tree ref #f))
+    out)
+  (let ((old-post-trees (git-ls-tree->hash old-master 'tree))
+        (new-post-trees (git-ls-tree->hash new-master 'tree)))
+    (let-values (((removed-post-trees added-post-trees)
+                  (compute-hash-diff old-post-trees new-post-trees)))
+      (let ((old-comments (make-hash-table))
+            (new-comments (make-hash-table)))
+        (hash-for-each
+         (lambda (sha1 name)
+           (git-ls-tree->hash (string-append sha1 ":comments") 'blob
+                              old-comments))
+         removed-post-trees)
+        (hash-for-each
+         (lambda (sha1 name)
+           (git-ls-tree->hash (string-append sha1 ":comments") 'blob
+                              new-comments))
+         added-post-trees)
+        (compute-hash-diff old-comments new-comments)))))
+
+(define (reindex-legit-comments old-index index)
+  (let ((old-legit-comments (assq-ref old-index 'legit-comments))
+        (old-master (assq-ref old-index 'master))
+        (new-master (assq-ref index 'master)))
+    (if old-legit-comments
+        (let-values (((removed added)
+                      (compute-differing-comments old-master new-master)))
+          (hash-for-each (lambda (k v)
+                           (hash-remove! old-legit-comments k))
+                         removed)
+          (hash-for-each (lambda (k v)
+                           (hash-set! old-legit-comments k v))
+                         added)
+          old-legit-comments)
+        (compute-legit-comments new-master))))
+
+(define (reindex-bogus-comments old-index index)
+  (let ((old-bogus-comments (assq-ref old-index 'bogus-comments))
+        (old-classifier (assq-ref old-index 'classifier))
+        (old-master (assq-ref old-index 'master))
+        (new-master (assq-ref index 'master)))
+    (if old-bogus-comments
+        (let-values (((removed added)
+                      (compute-differing-comments old-master new-master)))
+          (hash-for-each (lambda (k v)
+                           (hash-remove! old-bogus-comments k))
+                         added)
+          (hash-for-each (lambda (k v)
+                           (hash-set! old-bogus-comments k v))
+                         removed)
+          old-bogus-comments)
+        (compute-bogus-comments new-master (assq-ref index 'legit-comments)))))
+
+(define-record-type <classifier>
+  (make-classifier legit-prior legit-features bogus-features bogosities)
+  classifier?
+  (legit-prior classifier-legit-prior)
+  (legit-features classifier-legit-features)
+  (bogus-features classifier-bogus-features)
+  (bogosities classifier-bogosities))
+
+(define (rebuild-classifier legit-comments bogus-comments)
+  (format #t "Rebuilding bogus comment classifier...\n")
+  (with-time-debugging
+   (let* ((legit-count (hash-count (const #t) legit-comments))
+          (bogus-count (hash-count (const #t) bogus-comments))
+          (legit-prior (/ legit-count (+ legit-count bogus-count 0.0)))
+          (legit-features (count-features legit-comments))
+          (bogus-features (count-features bogus-comments))
+          (bogosities (compute-log-bogosities legit-features bogus-features)))
+     (make-classifier legit-prior legit-features bogus-features bogosities))))
+
+(define* (add-feature! features feature #:optional (count 1))
+  (let ((h (hash-create-handle! features feature 0)))
+    (set-cdr! h (+ (cdr h) count))))
+
+(define* (remove-feature! features feature #:optional (count 1))
+  (let ((h (hash-get-handle features feature)))
+    (when h
+      (set-cdr! h (- (cdr h) count)))))
+
+(define (reindex-classifier old-index index)
+  (match (assq-ref old-index 'classifier)
+    (#f
+     (rebuild-classifier (assq-ref index 'legit-comments)
+                         (assq-ref index 'bogus-comments)))
+    ((and classifier
+          ($ <classifier> legit-prior legit-features bogus-features bogosities))
+     (let-values (((removed added)
+                   (compute-differing-comments (assq-ref old-index 'master)
+                                               (assq-ref index 'master))))
+       (let ((removed-features (count-features removed))
+             (added-features (count-features added)))
+         ;; If a comment passes the spam filter, it gets added, and is
+         ;; presumed legitimate.  It could then be reverted, in which
+         ;; case we should remove its features from the legitimate count
+         ;; and add them to the bogus count.
+         (hash-for-each (lambda (k v)
+                          (remove-feature! legit-features k v)
+                          (add-feature! bogus-features k v))
+                        removed-features)
+         (hash-for-each (lambda (k v)
+                          ;; Asymmetry with removed-features; the
+                          ;; comment wasn't previously marked bogus, so
+                          ;; we just add its features to the legit set.
+                          (add-feature! legit-features k v))
+                        added-features)
+         (update-bogosities! bogosities removed-features
+                             legit-features bogus-features)
+         (update-bogosities! bogosities added-features
+                             legit-features bogus-features)))
+     classifier)))
+
+(define* (comment-bogus-probability classifier comment #:key (feature-limit 20))
+  (let* ((log-bogosities (classifier-bogosities classifier))
+         (bogus-prior (- 1.0 (classifier-legit-prior classifier))))
+    (compute-bogus-probability comment log-bogosities
+                               bogus-prior feature-limit)))
+
+(define* (comment-is-bogus? index comment #:key (threshold 0.5))
+  (let ((classifier (assq-ref index 'classifier)))
+    (> (comment-bogus-probability classifier comment) threshold)))
+
+#+end_src
+
+** comment.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/comment.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012, 2022, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Comments -- pulling them out of the database, and making new ones.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/comment.scm :mkdirp yes
+;;hack!
+(define-module (tekuti comment)
+  #:use-module (tekuti git)
+  #:use-module (tekuti util)
+  #:use-module (tekuti filters)
+  #:use-module (tekuti post)
+  #:use-module (ice-9 match)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-19)
+  #:use-module (sxml transform)
+  #:use-module (tekuti match-bind)
+  #:export (blob->comment comment-sxml-content comment-timestamp
+            comment-readable-date bad-new-comment-post?
+            parse-new-comment make-new-comment delete-comment
+            compute-legit-comments compute-bogus-comments))
+
+(define *comment-spec*
+  `((timestamp . ,string->number)
+    (format . ,string->symbol)))
+
+(define (blob->comment encoded-name sha1)
+  (let ((blob (git "show" sha1)))
+    (match-bind
+     "\n\n(.*)$" blob (_ content)
+     (append
+      `((raw-content . ,content)
+        (sha1 . ,sha1)
+        (key . ,encoded-name))
+      (match-lines (substring blob 0 (- (string-length blob)
+                                        (string-length _)))
+                   "^([^: ]+): +(.*)$" (_ k v)
+                   (let* ((k (string->symbol k))
+                          (parse (or (assq-ref *comment-spec* k) identity)))
+                     (cons k (parse v))))))))
+
+(define (comment-readable-date comment)
+  (let ((date (time-utc->date
+               (make-time time-utc 0 (assq-ref comment 'timestamp)))))
+    (date->string date "~e ~B ~Y ~l:~M ~p")))
+
+(define (comment-raw-content comment)
+  (assq-ref comment 'raw-content))
+
+(define (neutralize-links sxml)
+  (pre-post-order
+   sxml
+   `((a . ,(lambda sxml
+             (match sxml
+               (('a ('@ . attrs) . body)
+                `(a (@ (rel "external nofollow") . ,attrs) . ,body)))))
+     (*default* . ,(lambda sxml sxml))
+     (*text* . ,(lambda (tag text) text)))))
+
+(define (comment-sxml-content comment)
+  `(li (@ (class "comment") (id ,(assq-ref comment 'key)))
+       (header
+        (cite ,(let ((url (assq-ref comment 'author_url))
+                     (name (assq-ref comment 'author)))
+                 (if (and url (not (string-null? url)))
+                     `(a (@ (href ,url) (rel "external nofollow")) ,name)
+                     name)))
+        " says:"
+        (aside (a (@ (href ,(string-append "#" (assq-ref comment 'key))))
+                  ,(comment-readable-date comment))))
+       ,(neutralize-links
+         (let ((format (or (assq-ref comment 'format) 'wordpress)))
+           ((case format
+              ((wordpress) wordpress->sxml)
+              ((marxdown) marxdown->sxml)
+              (else (lambda (text) `(pre ,text))))
+            (comment-raw-content comment))))))
+
+(define (comment-timestamp comment-alist)
+  (or (assq-ref comment-alist 'timestamp) #f))
+
+(define (bad-email? x)
+  (if (emailish? x)
+      #f
+      `(p "Please pretend to specify a valid email address.")))
+
+(define (bad-url? x)
+  (if (or (string-null? x) (urlish? x))
+      #f
+      `(p "Bad URL. (Only http and https are allowed.)")))
+
+(define (bad-number? x)
+  (match (string->number x)
+    (#f '(p "Bad number. Give me something that Scheme's "
+            (tt "string->number") " will like."))
+    (n (if (and (real? n) (<= 34 n 42))
+           #f
+           '(p "Number not between 34 and 42.")))))
+
+(define *new-comment-spec*
+  `(("author" ,(lambda (x) #f))
+    ("email" ,bad-email?)
+    ("url" ,bad-url?)
+    ("comment" ,bad-user-submitted-marxdown?)
+    ("x" ,bad-number?)
+    ("submit" ,(lambda (x) #f))))
+
+(define (bad-new-comment-post? post-data)
+  (or (or-map (lambda (pair)
+                (and (not (assoc (car pair) *new-comment-spec*))
+                     `(p "Bad post data: " ,(car pair))))
+              post-data)
+      (or-map (lambda (pair)
+                (and (not (assoc (car pair) post-data))
+                     `(p "Incomplete post data:" ,(car pair))))
+              *new-comment-spec*)
+      (or-map (lambda (pair)
+                ((cadr pair) (assoc-ref post-data (car pair))))
+              *new-comment-spec*)))
+
+(define de-newline (s///g "[\n\r]" " "))
+
+(define (parse-new-comment post-data)
+  (let ((content (assoc-ref post-data "comment"))
+        (author (assoc-ref post-data "author"))
+        (email (assoc-ref post-data "email"))
+        (url (assoc-ref post-data "url")))
+    `((timestamp . ,(time-second (current-time)))
+      (author . ,(de-newline author))
+      (author_email . ,email)
+      (author_url . ,url)
+      (format . marxdown)
+      (raw-content . ,content))))
+
+(define (make-new-comment key title comment)
+  (let ((sha1 (with-output-to-blob
+               (for-each
+                (match-lambda
+                  ((k . v)
+                   (unless (eq? k 'raw-content)
+                     (format #t "~a: ~a\n" k v))))
+                comment)
+               (display "\n")
+               (display (assq-ref comment 'raw-content))))
+        (message (format #f "comment on \"~a\" by ~a" title
+                         (assq-ref comment 'author))))
+    (git-update-ref
+     "refs/heads/master"
+     (lambda (master)
+       (git-commit-tree (munge-tree1 master
+                                     'create
+                                     (list key "comments")
+                                     (list sha1 sha1 'blob))
+                        master message #f))
+     5)))
+
+(define (delete-comment post id)
+  (let ((key (post-key post))
+        (message (format #f "~a on \"~a\"" "comment deleted" (post-title post))))
+    (git-update-ref "refs/heads/master"
+                  (lambda (master)
+                    (git-commit-tree (munge-tree1 master
+                                                  'delete
+                                                  `(,key "comments")
+                                                  `(,id))
+                                     master message #f))
+                  5)))
+
+(define (compute-legit-comments master-ref)
+  ;; sha1 -> #t
+  (define legit (make-hash-table))
+  (pk 'computing-legit)
+  (for-each
+   (match-lambda
+     ((post-name post-sha1 'tree)
+      (for-each
+       (match-lambda
+         ((comment-name comment-sha1 'blob)
+          (hash-set! legit comment-sha1 comment-name)))
+       (git-ls-tree (string-append post-sha1 ":comments") #f))))
+   (git-ls-tree master-ref #f))
+  (pk 'done legit))
+
+(define (compute-bogus-comments master-ref legit)
+  ;; sha1 -> #t
+  (define visited-trees (make-hash-table))
+  (define bogus (make-hash-table))
+  (pk 'computing-bogus)
+  (fold-commits
+   (lambda (rev commit _)
+     (pk 'computing-bogus rev)
+     (for-each
+      (match-lambda
+        ((post-name post-sha1 'tree)
+         (unless (hash-ref visited-trees post-sha1)
+           (hash-set! visited-trees post-sha1 #t)
+           (for-each
+            (match-lambda
+              ((comment-name comment-sha1 'blob)
+               (unless (or (hash-ref legit comment-sha1)
+                           (hash-ref bogus comment-sha1))
+                 (hash-set! bogus comment-sha1 comment-name)))
+              (_ #f))
+            (git-ls-tree (string-append post-sha1 ":comments") #f))))
+        (_ #f))
+      (git-ls-tree (assq-ref commit 'tree) #f)))
+   (assq-ref (parse-commit master-ref) 'parent)
+   #f)
+  bogus)
+
+#+end_src
+
+** config.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/config.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012, 2014, 2021, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; This is the main script that will launch tekuti.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/config.scm :mkdirp yes
+(define-module (tekuti config)
+  #:use-module (tekuti util)
+  #:use-module ((sxml ssax) #:select (define-parsed-entity!))
+  #:declarative? #f
+  #:export (*public-scheme* *public-host* *public-port* *public-path-base*
+            *private-host* *private-port* *private-path-base*
+            *git-dir* *git* *debug* *admin-user* *admin-pass*
+            *css-file* *inline-css* *navbar-links* *navbar-infix*
+            *title* *subtitle* *name* *comments-open-window*
+            *server-impl* *server-impl-args*))
+
+(define *public-scheme* 'http)
+(define *public-host* "127.0.0.1")
+(define *public-port* 8080)
+(define *public-path-base* '())
+
+(define *private-host* "127.0.0.1")
+(define *private-port* 8080)
+(define *private-path-base* '())
+
+(define *git-dir* "~/blog.git")
+(define *git* "git")
+(define *css-file* "/base.css")
+(define *inline-css* #f)
+(define *navbar-links* '())
+(define *navbar-infix* " ")
+(define *debug* #t)
+(define *admin-user* "admin")
+(define *admin-pass* "admin")
+(define *title* "My blog")
+(define *subtitle* "Just a blog, ok")
+(define *name* "Joe Schmo")
+(define *comments-open-window* (* 60 60 24 21))
+
+(define *server-impl* 'http)
+(define *server-impl-args*
+  (lambda () `(#:host ,*private-host* #:port ,*private-port*)))
+
+(define-parsed-entity! 'agrave (string (integer->char 224)))
+(define-parsed-entity! 'laquo (string (integer->char 171)))
+(define-parsed-entity! 'mdash (string (integer->char 8212)))
+(define-parsed-entity! 'nbsp (string (integer->char 160)))
+(define-parsed-entity! 'raquo (string (integer->char 187)))
+(define-parsed-entity! 'uacute (string (integer->char 250)))
+
+#+end_src
+
+** filters.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/filters.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2011, 2012, 2022, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; This is the main script that will launch tekuti.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/filters.scm :mkdirp yes
+(define-module (tekuti filters)
+  #:use-module (sxml simple)
+  #:use-module (sxml transform)
+  #:use-module (tekuti marxdown)
+  #:use-module (tekuti match-bind)
+  #:use-module (tekuti util)
+  #:export (wordpress->sxml marxdown->sxml
+            *allowed-tags* bad-user-submitted-marxdown?))
+
+(define blocks '(table thead tfoot caption colgroup tbody tr td th div
+                 dl dd dt ul ol li pre select form map area blockquote
+                 address math style input p h1 h2 h3 h4 h5 h6))
+
+(define (can-contain-p? tag)
+  (memq tag '(div li blockquote)))
+
+(define (inline? tag)
+  (not (memq tag blocks)))
+
+(define (wpautop tag body)
+  (define (pclose p out)
+    (if p (cons (cons 'p (reverse p)) out) out))
+  (define (scons x p)
+    (if (and (string? x) (string-null? x))
+        p
+        (cons x (or p '()))))
+  (define (pbreak p)
+    (if p (cons '(br) p) p))
+
+  (let* ((head (if (and (pair? (car body))
+                        (eq? (caar body) '@))
+                   (list tag (car body))
+                   (list tag)))
+         (body (if (null? (cdr head)) body (cdr body))))
+    (let lp ((p #f) (in body) (out (reverse head)))
+      (cond
+       ((null? in)
+        (reverse (pclose p out)))
+       ((string? (car in))
+        (match-bind "^([^\n]*)\n(\n*)(.*)$" (car in) (_ head p-or-br? tail)
+                    (if (string-null? p-or-br?)
+                        (lp (if (string-null? tail)
+                                (scons head p)
+                                (pbreak (scons head p)))
+                            (scons tail (cdr in)) out)
+                        (lp #f (scons tail (cdr in))
+                            (pclose (scons head p) out)))
+                    (lp (scons (car in) p)
+                        (cdr in) out)))
+       ((inline? (caar in))
+        (lp (scons (car in) p) (cdr in) out))
+       (else
+        (lp #f (cdr in)
+            (cons (car in) (pclose p out))))))))
+
+(define (wordpress->sxml text)
+  (let ((sxml (cadr (with-input-from-string* (string-append "<div>" text "</div>")
+                      xml->sxml))))
+    (pre-post-order
+     sxml
+     `((*default* . ,(lambda (tag . body)
+                       (if (can-contain-p? tag)
+                           (wpautop tag body)
+                           (cons tag body))))
+       (*text* . ,(lambda (tag text)
+                    text))))))
+
+(define (marxdown->sxml text)
+  (smarxdown->shtml (call-with-input-string text marxdown->smarxdown)))
+
+(define (pre-class? class)
+  (string-prefix? "pre-" class))
+
+(define *allowed-tags*
+  `((a (href . ,urlish?) title)
+    (abbr title)
+    (acronym title)
+    (b)
+    (br)
+    (blockquote (cite . ,urlish?))
+    (code)
+    (em)
+    (i)
+    (p)
+    (pre (class . ,pre-class?))
+    (strike)
+    (strong)
+    (tt)))
+
+(define (compile-sxslt-rules tags)
+  (define (ok . body)
+    body)
+  (define (compile-attribute-rule rule)
+    (if (symbol? rule)
+        `(,rule . ,ok)
+        `(,(car rule) . ,(lambda (tag text)
+                           (or ((cdr rule) text)
+                               (throw 'bad-attr-value text))
+                           (list tag text)))))
+  `(,@(map (lambda (spec)
+             `(,(car spec)
+               ((@ *preorder*
+                   . ,(let ((rules `((@ (,@(map compile-attribute-rule
+                                                (cdr spec))
+                                         (*text*
+                                          . ,(lambda (tag text) text))
+                                         (*default*
+                                          . ,(lambda (tag . body)
+                                               (throw 'bad-attr tag))))
+                                        . ,ok))))
+                        (lambda tree
+                          (pre-post-order tree rules)))))
+               . ,ok))
+           *allowed-tags*)
+    (*text* . ,(lambda (tag text)
+                 text))
+    (*default* . ,(lambda (tag . body)
+                    (throw 'bad-tag tag)))))
+
+;; could be better, reflect nesting rules.
+(define *valid-xhtml-rules*
+  `((div ,(compile-sxslt-rules *allowed-tags*)
+         . ,(lambda body body))))
+
+(define (bad-user-submitted-marxdown? x)
+  (catch #t
+         (lambda ()
+           (pre-post-order (marxdown->sxml x) *valid-xhtml-rules*)
+           #f)
+         (lambda (key . args)
+           `(div (p (b "Invalid Marxdown"))
+                 (p "The input grammar is essentially Markdown.  However "
+                    "there are some differences, notably that e.g. *emph* "
+                    "blocks need to be properly closed and that any "
+                    "embedded HTML needs to be well-formed XHTML.")
+                 (p "Further information:")
+                 ,(case key
+                    ((parser-error)
+                     `(div
+                       (p "Valid XHTML is required, although it will "
+                          "translate single newlines to <br/> elements, "
+                          "and multiple newlines to paragraphs.")
+                       (p "Usually if you get here it's because you put in a "
+                          "malformed XHTML tag.")
+                       (p "Another way to get here is if "
+                          "you have an unescaped <, >, or & character. Replace "
+                          "them with &lt;, &gt;, or &amp;, respectively.")
+                       (p (b "Here is the internal error:"))
+                       (pre ,(with-output-to-string
+                               (lambda () (write args))))))
+                    ((bad-tag)
+                     `(p "XHTML tag disallowed: " ,(symbol->string (car args))))
+                    ((bad-attr)
+                     `(p "XHTML attribute disallowed: " ,(symbol->string (car args))))
+                    ((bad-attr-value)
+                     `(p "XHTML attribute has bad value: " ,(car args)))
+                    (else
+                     `(section
+                       (h4 "Internal error")
+                       (pre ,(with-output-to-string
+                               (lambda () (write (cons key args))))))))))))
+
+#+end_src
+
+** git.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2011, 2012, 2017 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Using git's object database as a persistent store.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
+(define-module (tekuti git)
+  #:use-module (ice-9 rdelim)
+  #:use-module (ice-9 popen)
+  #:use-module (ice-9 textual-ports)
+  #:use-module (tekuti util)
+  #:use-module (tekuti config)
+  #:use-module (tekuti match-bind)
+  #:use-module (rnrs bytevectors)
+  #:use-module (ice-9 binary-ports)
+  #:use-module ((srfi srfi-1) #:select (filter-map partition
+                                        delete-duplicates))
+  #:use-module (srfi srfi-34)
+  #:use-module (srfi srfi-35)
+  #:export (&git-condition git-condition? git-condition-argv
+            git-condition-output git-condition-status false-if-git-error
+
+            git git* ensure-git-repo git-ls-tree git-ls-subdirs
+            git-mktree git-rev-parse git-hash-object git-update-ref
+            git-commit-tree git-rev-list git-revert
+
+            munge-tree munge-tree1 parse-commit commit-utc-timestamp
+            fold-commits
+
+            with-output-to-blob with-input-from-blob))
+
+
+;;;
+;;; git conditions
+;;;
+
+(define-condition-type &git-condition &condition git-condition?
+  (argv git-condition-argv)
+  (output git-condition-output)
+  (status git-condition-status))
+
+(define-syntax false-if-git-error
+  (syntax-rules ()
+    ((_ body0 body ...)
+     (guard (c ((git-condition? c) #f))
+        body0 body ...))))
+
+;;;
+;;; running git
+;;;
+
+(define *debug* #f)
+(define (trc . args)
+  (if *debug*
+      (apply pk args)
+      (car (last-pair args))))
+
+(define (run env input-file args)
+  (define (prepend-env args)
+    (if (null? env)
+        args
+        (cons "env" (append env args))))
+  (define (redirect-input args)
+    (if input-file
+        (list "/bin/sh" "-c"
+              (string-append (string-join (map shell:quote args) " ")
+                             "<" input-file))
+        args))
+  (let* ((real-args (trc (redirect-input (prepend-env args))))
+         (pipe (apply open-pipe* OPEN_READ real-args)) ; TODO: open-pipe* gives unbound variable error
+         (output (get-string-all pipe))
+         (ret (close-pipe pipe)))
+    (case (status:exit-val ret)
+      ((0) output)
+      (else (trc 'git-error output ret real-args)
+            (raise (condition (&git-condition
+                               (argv real-args)
+                               (output output)
+                               (status ret))))))))
+
+(define* (git* args #:key (input #f) (env '()))
+  (if input
+      (call-with-temp-file
+       input
+       (lambda (tempname)
+         (trc input)
+         (run env tempname (cons* *git* "--bare" args))))
+      (run env #f (cons* *git* "--bare" args))))
+
+(define (git . args)
+  (git* args))
+
+;;;
+;;; git commands
+;;;
+
+(define (is-dir? path)
+  (catch 'system-error
+         (lambda () (eq? (stat:type (stat path)) 'directory))
+         (lambda args #f)))
+
+(define (ensure-git-repo)
+  (let ((d (expanduser *git-dir*)))
+    (if (not (is-dir? d))
+        (begin
+          (mkdir d)
+          (chdir d)
+          (git "init")
+          (git "update-ref" "refs/heads/master"
+               (git-commit-tree (string-trim-both (git* '("mktree") #:input ""))
+                                #f "initial commit" #f))) ;TODO: git-commit-tree is the source of the error
+        (chdir d))))
+
+(define (git-ls-tree treeish path)
+  (or (and treeish
+           (false-if-git-error
+            (match-lines (git "ls-tree" treeish (or path "."))
+                         "^(.+) (.+) (.+)\t(.+)$" (_ mode type object name)
+                         ;; reversed for assoc
+                         (list name object (string->symbol type)))))
+      '()))
+
+(define (git-ls-subdirs treeish path)
+  (or (and treeish
+           (false-if-git-error
+            (match-lines (git "ls-tree" treeish (or path "."))
+                         "^(.+) tree (.+)\t(.+)$" (_ mode object name)
+                         (cons name object))))
+      '()))
+
+(define (git-mktree alist)
+  (if (null? alist)
+      #f
+      (string-trim-both
+       (git* '("mktree")
+             #:input (string-join
+                      (map (lambda (l)
+                             (format #f
+                                     (if (or (null? (cddr l))
+                                             (equal? (caddr l) 'blob))
+                                         "100644 blob ~a\t~a"
+                                         "040000 tree ~a\t~a")
+                                     (cadr l) (car l)))
+                           alist)
+                      "\n" 'suffix)))))
+
+(define (git-rev-parse rev)
+  (or (false-if-exception
+       (let ((s (string-trim-both (call-with-input-file rev read-line))))
+         (and (= (string-length s) 40)
+              s)))
+      (string-trim-both (git "rev-parse" rev))))
+
+(define (git-rev-list rev n)
+  (let lp ((lines (string-split
+                   (git "rev-list" "--pretty=format:%ct %s"
+                        "-n" (number->string n) rev) #\newline))
+           (ret '()))
+    (if (or (null? lines)
+            (and (null? (cdr lines)) (string-null? (car lines))))
+        (reverse ret)
+        (lp (cddr lines)
+            (let ((line1 (car lines)) (line2 (cadr lines)))
+              (match-bind
+               "^commit (.*)$" line1 (_ sha1)
+               (match-bind
+                "^([0-9]+) (.*)$" line2 (_ ts subject)
+                (cons `(,sha1 ,(string->number ts) ,subject) ret)
+                (error "bad line2" line2))
+               (error "bad line1" line1)))))))
+
+(define (git-hash-object contents)
+  (string-trim-both
+   (git* '("hash-object" "-w" "--stdin") #:input contents)))
+
+(define (git-update-ref refname proc count)
+  (let* ((ref (git-rev-parse refname))
+         (commit (proc ref)))
+    (cond
+     ((zero? count)
+      (error "my god, we looped 5 times" commit))
+     ((false-if-git-error
+       (git "update-ref" refname commit ref))
+      commit)
+     (else
+      (pk "failed to update the ref, trying again..." refname)
+      (git-update-ref refname proc (1- count))))))
+
+(define (git-commit-tree tree parent message timestamp)
+  (string-trim-both
+   (git* (cons* "commit-tree" tree
+                (if parent (list "-p" parent) '()))
+         #:input message
+         #:env (if timestamp
+                   (list "GIT_COMMITTER_NAME=tekuti"
+                         "GIT_COMMITTER_EMAIL=tekuti@example.com"
+                         (format #f "GIT_COMMITTER_DATE=~a +0100" timestamp)
+                         (format #f "GIT_AUTHOR_DATE=~a +0100" timestamp))
+                   (list "GIT_COMMITTER_NAME=tekuti"
+                         "GIT_COMMITTER_EMAIL=tekuti@example.com")))))
+
+;;;
+;;; utilities
+;;;
+
+;; unused.
+(define (patch-blob sha1 patch)
+  (call-with-temp-file
+   (git "cat-file" "blob" sha1)
+   (lambda (orig)
+     (run '() patch (list "patch" "-N" "-s" "-u" "-r" "/dev/null" orig))
+     (with-output-to-blob
+       (display
+        (call-with-input-file orig
+          (lambda (port)
+            (read-delimited "" port))))))))
+
+;; could leave stray comments if the post directory changes. but this is
+;; probably the best that we can do, given that git does not track
+;; directory renames.
+(define (git-commit-reverse-operations sha1)
+  (with-input-from-string* (git "diff-tree" "-R" "-r" sha1)
+    (lambda ()
+      (read-line) ;; throw away the header
+      (let lp ((ops '()))
+        (let ((line (read-line)))
+          (if (eof-object? line)
+              ops
+              (match-bind
+               "^:([0-9]+) ([0-9]+) ([0-9a-f]+) ([0-9a-f]+) (.)\t(.*)$"
+               line (_ mode1 mode2 ob1 ob2 op path)
+               (let ((head (let ((d (dirname path)))
+                                  (if (string=? d ".") '()
+                                      (string-split d #\/))))
+                     (tail (basename path)))
+                 (lp
+                  (case (string-ref op 0)
+                    ((#\D) (cons `(delete ,head (,tail))
+                                 ops))
+                    ((#\A) (cons `(create ,head (,tail ,ob2 blob))
+                                 ops))
+                    ((#\M) (cons* `(delete ,head (,tail))
+                                  `(create ,head (,tail ,ob2 blob))
+                                  ops)))))
+               (error "crack line" line))))))))
+
+(define (git-revert ref sha1)
+  (let ((ops (git-commit-reverse-operations sha1)))
+    (git-update-ref ref
+                    (lambda (master)
+                      (git-commit-tree (munge-tree master ops)
+                                       master "revert change" #f))
+                    5)))
+
+(define (munge-tree1-local dents command arg)
+  (define (command-error why)
+    (error "munge-tree1-local error" why command arg))
+  (let ((dent (assoc (car arg) dents)))
+    (git-mktree
+     (case command
+       ((create) (if dent
+                     (command-error 'file-present)
+                     (cons arg dents)))
+       ((delete) (if dent
+                     (delq dent dents)
+                     (command-error 'file-not-present)))
+       ((rename) (if dent
+                     (acons (cadr arg) (cdr dent) (delq dent dents))
+                     (command-error 'file-not-present)))
+       (else (command-error 'unrecognized))))))
+
+(define (munge-tree1-recursive dents command ldir rdir arg)
+  (define (command-error why)
+    (error "munge-tree1-recursive error" why command ldir rdir arg))
+  (let ((dent (assoc ldir dents)))
+    (if (and dent (not (eq? (caddr dent) 'tree)))
+        (command-error 'not-a-tree))
+    (let ((subtree (and=> dent cadr))
+          (other-dents (if dent (delq dent dents) dents)))
+      (let ((new (case command
+                   ((create)
+                    (munge-tree1 subtree command rdir arg))
+                   ((delete rename)
+                    (if subtree
+                        (munge-tree1 subtree command rdir arg)
+                        (command-error 'file-not-present)))
+                   (else (command-error 'unrecognized)))))
+        (git-mktree (if new
+                        (cons (list ldir new 'tree) other-dents)
+                        other-dents))))))
+
+(define (munge-tree1 treeish command dir arg)
+  (let ((dents (git-ls-tree treeish #f)))
+    (if (null? dir)
+        (munge-tree1-local dents command arg)
+        (munge-tree1-recursive dents command (car dir) (cdr dir) arg))))
+
+;; (munge-tree sha1 ((create (key comments) (name sha1 blob))
+;;                   (delete (foo bar) (name))
+;;                   (rename (baz borky) (from to))))
+(define (munge-tree treeish operations)
+  (if (null? operations)
+      treeish
+      (let ((op (car operations)))
+        (munge-tree (munge-tree1 treeish (car op) (cadr op) (caddr op))
+                    (cdr operations)))))
+
+(define (parse-commit commit)
+  (let ((text (git "cat-file" "commit" commit)))
+    (match-bind
+     "\n\n(.*)$" text (_ message)
+     (acons
+      'message message
+      (match-lines (substring text 0 (- (string-length text) (string-length _)))
+                   "^([^ ]+) (.*)$" (_ k v)
+                   (cons (string->symbol k) v))))))
+
+(define (fold-commits f rev seed)
+  (let lp ((rev (git-rev-parse rev)) (seed seed))
+    (if rev
+        (let ((commit (parse-commit rev)))
+          (lp (assq-ref commit 'parent)
+              (f rev commit seed)))
+        seed)))
+
+(define (commit-utc-timestamp commit)
+  (match-bind
+   "^(.*) ([0-9]+) ([+-][0-9]+)" (assq-ref (parse-commit commit) 'committer)
+   (_ who ts tz)
+   (let ((ts (string->number ts)) (tz (string->number tz)))
+     (- ts (* (+ (* (quotient tz 100) 60) (remainder tz 100)) 60)))))
+
+(define (with-output-to-blob* thunk)
+  (git-hash-object (with-output-to-string* thunk)))
+
+(define-syntax with-output-to-blob
+  (syntax-rules ()
+    ((_ f f* ...)
+     (with-output-to-blob* (lambda () f f* ...)))))
+
+(define (with-input-from-blob* sha1 thunk)
+  (with-input-from-string* (git "show" sha1) thunk))
+
+(define-syntax with-input-from-blob
+  (syntax-rules ()
+    ((_ sha1 f f* ...)
+     (with-input-from-blob* sha1 (lambda () f f* ...)))))
+
+#+end_src
+
+** index.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/index.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Indexing of the persistent data store.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/index.scm :mkdirp yes
+(define-module (tekuti index)
+  #:use-module (ice-9 match)
+  #:use-module ((srfi srfi-1) #:select (fold))
+  #:use-module (system repl error-handling)
+  #:use-module (tekuti util)
+  #:use-module (tekuti git)
+  #:use-module (tekuti post)
+  #:use-module (tekuti tags)
+  #:use-module (tekuti cache)
+  #:use-module (tekuti classifier)
+  #:export (maybe-reindex read-index update-index))
+
+;; Additionally an index has an "index" field, indicating the commit
+;; that it was saved in, and a "master" field, indicating the commit
+;; that it indexes.
+(define index-specs
+  `((master #f ,write ,read)
+    (posts ,reindex-posts ,write-hash ,read-hash)
+    (posts-by-date ,reindex-posts-by-date ,write ,read)
+    (tags ,reindex-tags ,write-hash ,read-hash)
+    (legit-comments ,reindex-legit-comments ,write-hash ,read-hash)
+    (bogus-comments ,reindex-bogus-comments ,write-hash ,read-hash)
+    (classifier ,reindex-classifier #f #f)
+    (cache ,(lambda _ (make-empty-cache)) #f #f)))
+
+(define (reindex oldindex master)
+  ;; Leave off "index" field.
+  (with-time-debugging
+   (fold (lambda (spec index)
+           (match spec
+             ((key reindex write read)
+              (acons key (with-time-debugging (begin (pk key) (reindex oldindex index))) index))))
+         (acons 'master master '())
+         ;; Skip past "master" as we handle that one specially.
+         (match index-specs
+           ((('master . _) . specs) specs)))))
+
+(define (write-index index oldref)
+  (let ((new (git-commit-tree
+              (git-mktree
+               (let lp ((index index))
+                 (match index
+                   (() '())
+                   (((k . v) . index)
+                    (match (assq k index-specs)
+                      ((_ reindex write read)
+                       (if write
+                           (cons (list k (with-output-to-blob (write v)) 'blob)
+                                 (lp index))
+                           (lp index)))
+                      (_ (lp index)))))))
+              oldref "reindex\n"
+              (commit-utc-timestamp (assq-ref index 'master)))))
+    (or (false-if-git-error
+         (git "update-ref" "refs/heads/index" new (or oldref "")))
+        (warn "could not update indexes ref"))
+    new))
+
+(define (read-index)
+  (pk 'reading-index)
+  (match (false-if-git-error (git-rev-parse "refs/heads/index"))
+    (#f (maybe-reindex '()))
+    (ref
+     (let ((dents (git-ls-tree ref #f)))
+       (fold (lambda (spec index)
+               (match spec
+                 ((key reindex write read)
+                  (pk 'read-index-key key)
+                  (acons key
+                         (cond
+                          ((and read (assoc (symbol->string key) dents))
+                           => (match-lambda
+                                ((_ sha1 'blob)
+                                 (with-input-from-blob sha1 (read)))))
+                          (else
+                           (reindex '() index)))
+                         index))))
+             `((index . ,ref))
+             index-specs)))))
+
+(define (maybe-reindex old-index)
+  (let ((master (git-rev-parse "refs/heads/master")))
+    (if (equal? (assq-ref old-index 'master) master)
+        old-index
+        (call-with-error-handling
+         (lambda ()
+           (let ((new-index (reindex old-index master)))
+             (acons
+              'index (write-index new-index (assq-ref old-index 'index))
+              new-index)))
+         #:on-error 'backtrace
+         #:post-error (lambda _ old-index)))))
+
+(define (update-index index key update)
+  (cond
+   ((null? index) (acons key (update '()) '()))
+   ((eq? (caar index) key) (acons key (update index) (cdr index)))
+   (else (cons (car index) (update-index (cdr index) key update)))))
+
+#+end_src
+
+** marxdown.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/marxdown.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2022, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; "Marxdown" to SXML parser.
+;;
+;; Marxdown is a dialect of Markdown, designed for simplicity and
+;; embeddability.  The X in markdown refers to how it processes embedded
+;; XML.
+;;
+;; In some ways, Marxdown is a more restrictive subset of Markdown:
+;;
+;;   - Marxdown only supports headings with the ### prefix ("ATX
+;;     headings"), and doesn't support so-called "Setext headings" that
+;;     follow the heading with --- or similar.  Why bother?
+;;
+;;   - Marxdown doesn't support indented code blocks, instead only using
+;;     fenced code blocks.
+;;
+;;   - Markxdown doesn't currently support link titles or reference
+;;     links.
+;;
+;;   - Marxdown requires each line of a block quote to have the same
+;;     indent and `>` characters, not just the first line.
+;;
+;;   - Marxdown doesn't support multi-` inline code sequences; just the
+;;     single `.
+;;
+;;   - ...
+;;
+;; Generally speaking, a valid Marxdown document will also be valid
+;; Markdown, as defined by CommonMark.  However there are exceptions.
+;; Marxdown is less "sloppy", if you will; unlike Markdown, not any
+;; sequence of characters is valid Marxdown.  Parsing Marxdown can raise
+;; an error.
+;;
+;; Notably, Marxdown requires valid nesting.  For example, `*_foo*_` is
+;; an error in Marxdown, as the emphasis markers aren't nested properly.
+;;
+;; Also, when Marxdown parses embedded XML, it hands over control of the
+;; character stream to a validating XML parser which can also throw an
+;; error.  This XML parser doesn't stop at what CommonMark Markdown
+;; would consider block boundaries.  As a consequence, Marxdown cannot
+;; be embedded inside XML.  Due to a limitation which may be relaxed in
+;; the future, the XML parser doesn't strip off any blockquote prefix.
+;;
+;; These limitations come with a benefit: tools can easily consume
+;; Marxdown and then embed that result in SXML documents of different
+;; kinds.
+;; 
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/marxdown.scm :mkdirp yes
+(define-module (tekuti marxdown)
+  #:use-module (ice-9 match)
+  #:use-module (ice-9 textual-ports)
+  #:use-module (ice-9 rdelim)
+  #:use-module (sxml ssax)
+  #:use-module (sxml transform)
+  #:use-module ((sxml simple) #:select (sxml->string))
+  #:use-module ((srfi srfi-1) #:select (fold append-map))
+  #:export (marxdown->smarxdown
+            smarxdown->marxdown
+            smarxdown->shtml
+            shtml->smarxdown))
+
+(define (parse-one-xml-element port)
+  ;; -> seed
+  (define (fdown elem-gi attributes namespaces expected-content seed)
+    '())
+  ;; -> seed
+  (define (fup elem-gi attributes namespaces parent-seed seed)
+    (cons `(,elem-gi
+            ,@(match namespaces
+                (() '())
+                ;; fixme: prohibit?
+                (_ `((*NAMESPACES* ,namespaces))))
+            ,@(match attributes
+                (() '())
+                (((attr . value) ...)
+                 `((@ . ,(map list attr value)))))
+            . ,(reverse seed))
+          parent-seed))
+  (define (ftext string1 string2 seed)
+    (if (string-null? string2)
+        (cons string1 seed)
+	(cons* string2 string1 seed)))
+  (define parse-element (ssax:make-elem-parser fdown fup ftext ()))
+
+  (let ((token (ssax:read-markup-token port)))
+    (match (xml-token-kind token)
+      ('COMMENT #f)
+      ('START
+       (let ((elems #f) (entities '()) (namespaces '()) (seed '()))
+         (match (parse-element (xml-token-head token) port elems
+		               entities namespaces #t seed)
+           ((elt) elt))))
+      (kind (error "unexpected XML token" token)))))
+
+(define (marxdown->smarxdown port)
+  (define (round-up x y)
+    (* y (ceiling-quotient x y)))
+
+  (define (advance/tab indent)
+    (round-up (1+ indent) 4))
+
+  (define (advance indent)
+    (1+ indent))
+
+  (define (unget1 ch)
+    (unget-char port ch))
+  (define (unget chars)
+    (match chars
+      (()
+       (values))
+      ((ch . chars)
+       (unget1 ch)
+       (unget chars))))
+
+  (define (next) (get-char port))
+  (define (peek) (peek-char port))
+
+  (define (next-not-eof ctx)
+    (let ((ch (next)))
+      (if (eof-object? ch)
+          (error "EOF while reading" ctx)
+          ch)))
+  (define (next-line-and-delim)
+    (let lp ((chars '()))
+      (define (finish delim)
+        (cons (reverse-list->string chars) delim))
+      (let ((ch (next)))
+        (cond
+         ((eof-object? ch) (finish ch))
+         ((eqv? ch #\return)
+          (if (eqv? (peek) #\newline)
+              (finish (next))
+              (lp (cons ch chars))))
+         ((eqv? ch #\newline)
+          (finish ch))
+         (else
+          (lp (cons ch chars)))))))
+
+  (define (skip-whitespace k)
+    (let lp ((indent 0))
+      (let ((ch (next)))
+        (case ch
+          ((#\space)
+           (lp (advance indent)))
+          ((#\tab)
+           (lp (advance/tab indent)))
+          (else
+           (k ch indent))))))
+
+  (define empty-indent '(0))
+  (define (read-indent k)
+    (skip-whitespace
+     (lambda (ch indent)
+       (match ch
+         (#\>
+          (read-indent
+           (lambda (ch indent*)
+             (k ch
+                (cons indent
+                      (match indent*
+                        ((head . tail)
+                         ;; Account for the #\>.
+                         (cons (1+ head) tail))))))))
+         (_
+          (k ch (list indent)))))))
+
+  (define (advance-indent indent)
+    (match indent
+      ((indent* ... indent)
+       (append indent* (list (advance indent))))))
+
+  (define (advance-indent/tab indent)
+    (let* ((col (apply + indent))
+           (col* (advance/tab col)))
+      (match indent
+        ((indent* ... indent)
+         (append indent* (+ (- col* col) indent))))))
+
+  (define (compare-indents prev new)
+    (match (vector prev new)
+      (#((x . prev-tail) (x . new-tail))
+       (compare-indents prev-tail new-tail))
+      (_
+       (match (vector prev new)
+         (#(() ()) 'same)
+         (#((prev) (new)) (if (< prev new) 'inner 'outer))
+         (#((prev . _) (new . _))
+          (if (< prev new) 'inner-blockquote 'different-blockquote))
+         (#(() _) 'inner-blockquote)
+         (#(_ ()) 'outer-blockquote)
+         (_ 'different-blockquote)))))
+
+  ;; indent as list of blockquote
+
+  ;; kup ::= (node type info indent) -> _
+  ;; knext ::= nodelist -> node
+
+  (define (drop-whitespace-up-to n col kt kf)
+    (define col-end (+ col n))
+    (let lp ((n n) (chars '()))
+      (cond
+       ((zero? n) (kt))
+       (else
+        (match (next)
+          (#\space (lp (1- n) (cons #\space chars)))
+          (#\tab
+           (let ((col (advance/tab (- col-end n))))
+             (cond
+              ((<= col col-end)
+               (lp (- col-end col) (cons #\tab chars)))
+              (else (kt)))))
+          (#\newline
+           ;; Sure.  Trailing whitespace can be any indent.
+           (unget1 #\newline)
+           (kt))
+          (#\return
+           (lp n (cons #\return chars)))
+          (ch
+           (unless (eof-object? ch) (unget1 ch))
+           (unget chars)
+           (kf)))))))
+
+  (define (drop-whitespace-then-blockquote n col kt kf)
+    (define col-end (+ col n))
+    (let lp ((n n) (kf kf))
+      (let* ((ch (next))
+             (kf (lambda () (unless (eof-object? ch) (unget1 ch)) (kf))))
+        (cond
+         ((zero? n)
+          (match ch
+            (#\> (kt kf))
+            (_ (kf))))
+         (else
+          (match ch
+            (#\space (lp (1- n) kf))
+            (#\tab
+             (let ((col (advance/tab (- col-end n))))
+               (cond
+                ((<= col col-end) (lp (- col-end col) kf))
+                (else (kf)))))
+            (_ (kf))))))))
+
+  (define (consume-indent indent kt kf)
+    (match indent
+      ((0) (kt))
+      (_
+       (let lp ((indent indent) (col 0) (kf kf))
+         (match indent
+           ((n) (drop-whitespace-up-to n col kt kf))
+           ((n m . indent)
+            (let* ((indent (cons (1- m) indent))
+                   (kt (lambda (kf) (lp indent (+ col n 1) kf))))
+              (drop-whitespace-then-blockquote n col kt kf))))))))
+
+  (define (read-pre tag indent k)
+    (let lp ((body '()))
+      (define (finish tail)
+        (k (list 'pre tag (string-concatenate-reverse body tail))))
+      (consume-indent
+       indent
+       (lambda ()
+         (match (next-line-and-delim)
+           ((str . delim)
+            (cond
+             ((eof-object? delim)
+              (finish (if (eof-object? str) "" str)))
+             ((string=? str "```")
+              (finish ""))
+             (else
+              (lp (cons* (string delim) str body)))))))
+       (lambda ()
+         (finish "")))))
+
+  (define (read-link-destination)
+    (match (next-not-eof "link destination")
+      (#\<
+       (let lp ((chars '()))
+         (match (next-not-eof "<>-delimited link")
+           (#\> (reverse-list->string chars))
+           (#\< (error "< inside <>-delimited link"))
+           (#\\
+            (match (next)
+              ((? eof-object?) (lp (cons #\\ chars)))
+              (ch (lp (cons ch chars)))))
+           (ch (lp (cons ch chars))))))
+      (ch
+       (unget1 ch)
+       (let lp ((chars '()) (k reverse-list->string))
+         (match (next-not-eof "link destination")
+           (#\) (unget1 #\)) (k chars))
+           ((and ch
+                 (or #\space #\)
+                     (? (lambda (ch)
+                          (or (char<? ch (integer->char #x20))
+                              (char=? ch (integer->char #x7f)))))))
+            (unget1 ch)
+            (k chars))
+           (#\(
+            (lp (cons #\( chars)
+                (lambda (chars)
+                  (match (next-not-eof "link destination")
+                    (#\) (lp (cons #\) chars) k))
+                    (ch (error "unexpected char" ch))))))
+           (#\\
+            (lp (cons (next-not-eof "link-destination") chars) k))
+           (ch (lp (cons ch chars) k)))))))
+
+  (define (read-link indent continue)
+    (read-text
+     #f indent
+     (lambda (ch)
+       (match ch
+         (#\]
+          (lambda (text)
+            (match (next)
+              (#\(
+               (let ((dest (read-link-destination)))
+                 (match (next)
+                   (#\)
+                    (continue `(link ,dest . ,text)))
+                   (ch
+                    (error "unexpected after link dest" ch)))))
+              (ch (error "link missing destination URL")))))
+         (_ #f)))
+     (lambda (elts)
+       (error "end-of-block while reading link"))))
+
+  (define (read-emph indent delim continue)
+    (define (delim? ch) (eqv? ch delim))
+    (match (next-not-eof "emphasis")
+      ((? delim?)
+       (let ((done? (lambda (ch)
+                      (match ch
+                        ((? delim?)
+                         (match (next-not-eof "emphasis")
+                           ((? delim?) continue)
+                           (ch (unget1 ch) #f)))
+                        (_ #f)))))
+         (read-text 'strong indent done?
+                    (lambda (elt)
+                      (error "end of block while reading strong" elt)))))
+      (ch
+       (unget1 ch)
+       (let ((done? (lambda (ch) (and (delim? ch) continue))))
+         (read-text 'emph indent done?
+                    (lambda (elt)
+                      (error "end of block while reading emph" elt)))))))
+
+  (define (read-code indent continue)
+    (let lp ((chars '()))
+      (match (next-not-eof "backticks")
+        (#\` (continue `(code ,(reverse-list->string chars))))
+        (#\return (lp chars))
+        (#\newline
+         (consume-indent
+          indent
+          (lambda ()
+            (match (next-not-eof "code")
+              ((or #\return #\newline)
+               (error "end of block while reading code"))
+              (ch (unget1 ch) (lp (cons #\space chars)))))
+          (lambda () (error "end of block while reading code"))))
+        (ch (lp (cons ch chars))))))
+
+  (define (read-text tag indent done? on-block-end)
+    (let lp ((quotes '()) (apostrophe? #f) (elts '()))
+      (define (continue elt) (lp quotes apostrophe? (cons elt elts)))
+      (define (finish kdone)
+        (let lp ((elts elts) (out '()))
+          (match elts
+            (() (kdone (if tag (cons tag out) out)))
+            (((? char? ch) . elts)
+             (let lp2 ((elts elts) (chars (list ch)))
+               (match elts
+                 (((? char? ch) . elts)
+                  (lp2 elts (cons ch chars)))
+                 (_
+                  (lp elts (cons (list->string chars) out))))))
+            ((elt . elts)
+             (lp elts (cons elt out))))))
+      (define (consume-blank-lines-then-finish kdone)
+        (let lp ()
+          (match (next)
+            ((? eof-object?) (finish kdone))
+            (#\return (lp))
+            (#\newline
+             (consume-indent indent lp (lambda () (finish kdone))))
+            (ch
+             (unget1 ch)
+             (finish kdone)))))
+      (match (next)
+        ((? eof-object?) (finish on-block-end))
+        (#\return (lp quotes #f elts))
+        (#\newline
+         (consume-indent
+          indent
+          (lambda ()
+            (cond
+             ((done? #\newline) => consume-blank-lines-then-finish)
+             (else (lp quotes #f (cons #\newline elts)))))
+          (lambda ()
+            (finish on-block-end))))
+        ((= done? (and kdone (not #f))) (finish kdone))
+        ((and (or #\_ #\*) delim) (read-emph indent delim continue))
+        (#\` (read-code indent continue))
+        (#\[
+         (read-link indent continue))
+        (#\<
+         (unget1 #\<)
+         (match (parse-one-xml-element port)
+           (#f (lp quotes apostrophe? elts))
+           (elt (continue `(inline-xml ,elt)))))
+        (#\"
+         (match quotes
+           ((#\" . quotes)
+            (lp quotes #t (cons #\” elts)))
+           (_
+            (lp (cons #\" quotes) #f (cons #\“ elts)))))
+        (#\'
+         (match quotes
+           ((#\' . quotes)
+            (lp quotes #f (cons #\’ elts)))
+           (_
+            (if apostrophe?
+                (lp quotes #t (cons #\’ elts))
+                (lp (cons #\' quotes) #f (cons #\‘ elts))))))
+        (#\\ (lp quotes apostrophe? (cons (next-not-eof "backslash") elts)))
+        (#\- (match (next)
+               (#\-
+                (match (next)
+                  (#\- (lp quotes #f (cons #\— elts)))
+                  (ch
+                   (unget1 ch)
+                   (lp quotes #f (cons #\– elts)))))
+               (ch
+                (unget1 ch)
+                (lp quotes #f (cons #\- elts)))))
+        (#\! (match (next)
+               ((? eof-object?) (lp quotes #f (cons #\! elts)))
+               (#\[
+                (read-link indent
+                           (lambda (link)
+                             (match link
+                               (('link dest . alt)
+                                (continue `(image ,dest . ,alt)))))))
+               (ch
+                (unget1 ch)
+                (lp quotes #f (cons #\! elts)))))
+        (ch (lp quotes (not (char-whitespace? ch)) (cons ch elts))))))
+
+  (define (read-para indent kup knext)
+    (define (make-continuation reader)
+      (lambda (para)
+        (reader indent kup (lambda (nodelist)
+                             (knext (cons para nodelist))))))
+    (define (done? ch)
+      (match ch
+        (#\newline
+         (let lp ((ch (next)))
+           (match ch
+             ((? eof-object?)
+              (lambda (para)
+                (kup (knext (list para)) ch empty-indent)))
+             (ch
+              (read-block-type ch #t
+                               make-continuation
+                               (if (eqv? ch #\newline)
+                                   (lambda (chars)
+                                     (unget chars)
+                                     (make-continuation read-para))
+                                   (lambda (chars)
+                                     (unget chars)
+                                     #f)))))))
+        (_ #f)))
+    (read-text 'para indent done? (make-continuation read-block-list)))
+
+  (define (read-para* chars indent kup knext)
+    (unget chars)
+    (read-para indent kup knext))
+
+  (define (read-heading level indent continue)
+    (let ((continue (lambda (heading)
+                      (match heading
+                        (('heading . body)
+                         (continue `(heading ,level . ,body)))))))
+      (read-text 'heading indent (lambda (ch)
+                                   (and (eqv? ch #\newline) continue))
+                 continue)))
+
+  (define (read-li marker marker-indent marker-size kup knext)
+    (define list-tag
+      (match marker
+        ((? number?) 'enumerate)
+        ((? char?) 'itemize)))
+    (define (list-tag? tag) (eq? tag list-tag))
+    (read-indent
+     (lambda (ch indent)
+       (match indent
+         ((outer . inner)
+          (match marker-indent
+            ((marker-outer ... marker-inner)
+             (let ((body-indent
+                    (append marker-outer
+                            (list (+ marker-inner marker-size outer))
+                            inner)))
+               (read-block
+                ch body-indent
+                (lambda (blocks ch next-indent)
+                  (read-indented-block
+                   ch marker-indent next-indent kup
+                   (lambda (nodelist)
+                     (knext
+                      (match nodelist
+                        ((((? list-tag?) . items) . nodelist)
+                         `((,list-tag (item . ,blocks) . ,items) . ,nodelist))
+                        (_
+                         `((,list-tag (item . ,blocks)) . ,nodelist)))))))
+                identity)))))))))
+
+  (define (read-block-type ch in-text? kblock ktext)
+    (define (make-continue indent kup knext)
+      (lambda (block)
+        (read-block-list indent kup
+                         (lambda (nodelist)
+                           (knext (cons block nodelist))))))
+    (match ch
+      (#\#
+       (let lp ((level 1))
+         (match (next-not-eof "heading")
+           (#\#
+            (lp (1+ level)))
+           (#\space
+            (kblock
+             (lambda (indent kup knext)
+               (read-heading level indent (make-continue indent kup knext)))))
+           (#\return (lp level))
+           (#\newline
+            (kblock
+             (lambda (indent kup knext)
+               ((make-continue indent kup knext) `(heading ,level)))))
+           (ch
+            (ktext (cons ch (make-list level #\#)))))))
+      (#\`
+       (match (next)
+         ((? eof-object?) (ktext '(#\`)))
+         (#\`
+          (match (next)
+            ((? eof-object?) (ktext '(#\` #\`)))
+            (#\`
+             (kblock
+              (lambda (indent kup knext)
+                (match (next-line-and-delim)
+                  ((tag . delim)
+                   (cond
+                    ((eof-object? delim)
+                     (error "eof while reading code block"))
+                    (else
+                     (read-pre (if (string-null? tag) #f tag) indent
+                               (make-continue indent kup knext)))))))))
+            (ch
+             (ktext (list ch #\` #\`)))))
+         (ch
+          (ktext (list ch #\`)))))
+      ((or #\- #\* #\+)
+       (match (peek)
+         ((or #\space #\tab)
+          (kblock (lambda (indent kup knext)
+                    (read-li ch indent 1 kup knext))))
+         (_
+          (ktext (list ch)))))
+      ((or #\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9)
+       (let lp ((chars (list ch)))
+         (let ((ch (next)))
+           (match ch
+             ((? eof-object?) (ktext chars))
+             ((or #\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9)
+              (lp (cons ch chars)))
+             ((or #\. #\))
+              ;; fixme: record delimiter
+              (match (next)
+                ((? eof-object?)
+                 (ktext (cons ch chars)))
+                ((and ch2 (or #\space #\tab))
+                 (unget1 ch2)
+                 (if (or (not in-text?) (equal? chars '(#\1)))
+                     (kblock
+                      (lambda (indent kup knext)
+                        (let ((idx (fold (lambda (ch idx)
+                                           (+ (* idx 10)
+                                              (- (char->integer ch)
+                                                 (char->integer #\0))))
+                                         0 chars)))
+                          (read-li idx indent (1+ (length chars))
+                                   kup knext))))
+                     (ktext (cons ch chars))))
+                (ch2
+                 (ktext (cons* ch2 ch chars)))))
+             (_
+              (ktext (cons ch chars)))))))
+      (#\<
+       (unget1 #\<)
+       (if in-text?
+           (ktext '())
+           (kblock
+            (lambda (indent kup knext)
+              (match (parse-one-xml-element port)
+                (#f (read-block-list indent kup knext))
+                (elt ((make-continue indent kup knext) `(block-xml ,elt))))))))
+      (#\return
+       (read-block-type (next-not-eof "newline") in-text? kblock ktext))
+      (#\newline
+       ;; fixme: record loose li
+       (kblock read-block-list))
+      ((? eof-object?)
+       (kblock
+        (lambda (indent kup knext)
+          (kup (knext '()) ch empty-indent))))
+      (_
+       (ktext (list ch)))))
+
+  (define (read-block ch indent kup knext)
+    (define (have-block read-block)
+      (read-block indent kup knext))
+    (define (have-text chars)
+      (read-para* chars indent kup knext))
+    (read-block-type ch #f have-block have-text))
+
+  (define (finish-block-list blocks)
+    (match blocks
+      ((block) block)
+      (_ `(begin . ,blocks))))
+  (define (finish-block-quote blocks)
+    (match blocks
+      ((block) block)
+      (_ `(blockquote . ,blocks))))
+
+  (define (read-indented-block ch outer-indent indent kup knext)
+    (define (recurse finish recurse-indent)
+      (read-indented-block ch recurse-indent indent
+                           (lambda (nested ch indent)
+                             (read-indented-block ch outer-indent indent
+                                                  kup
+                                                  (lambda (nodelist)
+                                                    (knext (cons nested nodelist)))))
+                           finish))
+    (match (compare-indents outer-indent indent)
+      ('same
+       (read-block ch indent kup knext))
+      ((or 'outer
+           'outer-blockquote
+           'different-blockquote)
+       (kup (knext '()) ch indent))
+      ('inner
+       (recurse finish-block-list indent))
+      ('inner-blockquote
+       (recurse finish-block-quote
+                (list-head indent (1+ (length outer-indent)))))))
+
+  (define (parse-error reason)
+    (error reason))
+
+  (define (read-block-list outer-indent kup knext)
+    (read-indent
+     (lambda (ch indent)
+       (read-indented-block ch outer-indent indent kup knext))))
+
+  (read-block-list empty-indent
+                   (lambda (nodelist ch indent) nodelist)
+                   finish-block-list))
+
+(define (fill-block strings width prefix)
+  (define (split-words strings)
+    (filter
+     (compose not string-null?)
+     (string-split (string-concatenate strings) char-set:whitespace)))
+  (define (build-lines words width)
+    (define (finish-line line)
+      (string-join (reverse line) " "))
+    (let lp ((words words) (line '()) (col 0))
+      (match words
+        (()
+         (if (null? line)
+             '()
+             (cons (finish-line line) '())))
+        ((word . words*)
+         (let ((col (+ (if (zero? col) col (1+ col))
+                       (string-length word))))
+           (if (or (<= col width) (null? line))
+               (lp words* (cons word line) col)
+               (cons (finish-line line)
+                     (build-lines words width))))))))
+  (string-join
+   (build-lines (split-words strings) width)
+   (string-append "\n" prefix)))
+
+(define* (smarxdown->marxdown exp #:key (width 72))
+  (define (transform-inline exp)
+    (match exp
+      (('inline-xml xml)
+       (list (sxml->string xml)))
+      (('code . body)
+       `("`" ,@body "`"))
+      (('emph . body)
+       `("*" ,@(transform-inline* body) "*"))
+      (('strong . body)
+       `("**" ,@(transform-inline* body) "**"))
+      (('link dest . body)
+       `("[" ,@(transform-inline* body) "](" ,dest ")"))
+      ((? string? str)
+       (list str))))
+  (define (transform-inline* exps)
+    (append-map transform-inline exps))
+  (define (transform-block exp prefix)
+    (match exp
+      (('block-xml xml) (sxml->string xml))
+      (('para . body)
+       (string-append
+        (fill-block (transform-inline* body) width prefix)
+        "\n"))
+      (('blockquote . body)
+       (string-append
+        "> "
+        (fill-block (transform-inline* body) (- width 2)
+                    (string-append prefix "> "))
+        "\n"))
+      (('itemize ('item . item) ...)
+       (string-join
+        (map
+         (lambda (blocks)
+           (string-append " * "
+                          (transform-block `(begin . ,blocks)
+                                           (string-append prefix "   "))))
+         item)))
+      (('enumerate ('item . item) ...)
+       (string-join
+        (map
+         (lambda (blocks)
+           (string-append " 1. "
+                          (transform-block `(begin . ,blocks)
+                                           (string-append prefix "    "))))
+         item)))
+      (('pre #f . body)
+       (string-append "```\n" (string-concatenate body) "```"))
+      (('pre info . body)
+       (string-append "```" info "\n" (string-concatenate body) "```"))
+      (('heading level . body)
+       (string-append (make-string level #\#) " "
+                      (string-concatenate (transform-inline* body))))
+      (('begin block ...)
+       (string-join (map (lambda (block) (transform-block block "")) exp)
+                    (string-append "\n\n" prefix)))))
+  (transform-block exp ""))
+
+(define* (smarxdown->shtml exp #:key
+                           (heading-offset 0)
+                           (handle-inline-xml identity)
+                           (handle-block-xml identity))
+  (define (transform-inline exp)
+    (match exp
+      (('inline-xml xml) (handle-inline-xml xml))
+      (('code . body) `(tt . ,body))
+      (('emph . body) `(i . ,(map transform-inline body)))
+      (('strong . body) `(b . ,(map transform-inline body)))
+      (('link dest . body) `(a (@ (href ,dest)) . ,(map transform-inline body)))
+      ((? string? str) str)))
+  (define (transform-block exp)
+    (match exp
+      (('block-xml xml) (handle-block-xml xml))
+      (('para . body) `(p . ,(map transform-inline body)))
+      (('blockquote . body) `(blockquote . ,(map transform-block body)))
+      (('itemize ('item . item) ...)
+       `(ul . ,(map (lambda (blocks)
+                      `(li . ,(map transform-block blocks)))
+                    item)))
+      (('enumerate ('item . item) ...)
+       `(ol . ,(map (lambda (blocks)
+                      `(li . ,(map transform-block blocks)))
+                    item)))
+      (('pre #f . body) `(pre . ,body))
+      (('pre info . body) `(pre (@ (class ,(string-append "pre-" info)))
+                                . ,body))
+      (('heading level . body)
+       (let* ((level (+ level heading-offset))
+              (tag (cond ((<= level 0) 'h1)
+                         ((<= level 6)
+                          (string->symbol
+                           (string #\h (integer->char
+                                        (+ level (char->integer #\0))))))
+                         (else 'h6))))
+         `(,tag . ,(map transform-inline body))))))
+  (match exp
+    (('begin exp ...)
+     `(div . ,(map transform-block exp)))
+    (_ `(div ,(transform-block exp)))))
+
+(define* (shtml->smarxdown exp #:key
+                           (heading-offset 0))
+  (define (transform-inline exp)
+    (match exp
+      (('tt . body) `(code . ,body))
+      (((or 'i 'em) . body) `(emph . ,(map transform-inline body)))
+      (((or 'b 'strong) . body) `(string . ,(map transform-inline body)))
+      (('a ('@ ('href dest)) . body) `(link ,dest . ,(map transform-inline body)))
+      ((? string? str) str)
+      (xml `(inline-xml ,xml))))
+  (define (transform-block exp)
+    (match exp
+      (('pre ('@ ('class (? (lambda (c) (string-prefix? "pre-" c))) c)) . body)
+       `(pre ,(substring c 4) . ,body))
+      ((_ ('@ . _) . _)
+       `(block-xml ,exp))
+      (('p . body) `(para . ,(map transform-inline body)))
+      (('blockquote . body) `(blockquote . ,(map transform-block body)))
+      (('ul ('li . item) ...)
+       `(itemize . ,(map (lambda (blocks)
+                           `(item . ,(map transform-block blocks)))
+                         item)))
+      (('ol ('li . item) ...)
+       `(enumerate . ,(map (lambda (blocks)
+                             `(item . ,(map transform-block blocks)))
+                           item)))
+      (('pre . body)
+       `(pre #f . ,body))
+      (('h1 . body)
+       `(heading ,(+ 1 heading-offset) ,(map transform-inline body)))
+      (('h2 . body)
+       `(heading ,(+ 2 heading-offset) ,(map transform-inline body)))
+      (('h3 . body)
+       `(heading ,(+ 3 heading-offset) ,(map transform-inline body)))
+      (('h4 . body)
+       `(heading ,(+ 4 heading-offset) ,(map transform-inline body)))
+      (('h5 . body)
+       `(heading ,(+ 5 heading-offset) ,(map transform-inline body)))
+      (('h6 . body)
+       `(heading ,(+ 6 heading-offset) ,(map transform-inline body)))
+      (('div . body)
+       `(begin . ,(map transform-block body)))
+      (xml `(block-xml ,xml))))
+  (transform-block exp))
+
+#+end_src
+
+** match-bind.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/match-bind.scm :mkdirp yes
+;; (match-bind) -- binding variables from regular expression matches
+;; Copyright (C) 2007, 2009, 2010, 2012 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+;;; Commentary:
+;;
+;; @c
+;; Utility functions and syntax constructs for dealing with regular
+;; expressions in a concise manner.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/match-bind.scm :mkdirp yes
+(define-module (tekuti match-bind)
+  #:use-module (ice-9 regex)
+  #:export (match-bind
+            s///
+            s///g))
+
+(define (regex:count re-string)
+  (let lp ((char-class #f) (nparen 0) (in (string->list re-string)))
+    (cond
+     ((null? in) nparen)
+     ((char=? (car in) #\\)
+      (lp char-class nparen (cddr in)))
+     ((char=? (car in) #\[)
+      (lp #t nparen (cdr in)))
+     ((char=? (car in) #\])
+      (lp #f nparen (cdr in)))
+     ((and (char=? (car in) #\() (not char-class))
+      (lp #f (1+ nparen) (cddr in)))
+     (else
+      (lp char-class nparen (cdr in))))))
+
+(define-syntax match-substring
+  (syntax-rules ()
+    ((_ m i)
+     (let* ((pair (vector-ref m (1+ i)))
+            (start (car pair))
+            (end (cdr pair)))
+       (if (or (= start -1) (= end -1))
+           #f
+           (substring (vector-ref m 0) start end))))))
+
+(define *cache* (make-weak-key-hash-table))
+(define (memoize-re regex)
+  (cond
+   ((hashq-ref *cache* regex))
+   (else
+    (let ((re (make-regexp regex)))
+      (hashq-set! *cache* regex re)
+      re))))
+
+(define-syntax match-bind
+  (lambda (x)
+    "Match a string against a regular expression, binding lexical
+variables to the various parts of the match.
+
+@var{vars} is a list of names to which to bind the parts of the match.
+The first variable of the list will be bound to the entire match, so the
+number of variables needed will be equal to the number of open
+parentheses (`(') in the pattern, plus one for the whole match.
+
+@var{consequent} is executed if the given expression @var{str} matches
+@var{regex}. If the string does not match, @var{alternate} will be
+executed if present. If @var{alternate} is not present, the result of
+@code{match-bind} is unspecified.
+
+Here is a short example:
+@example
+ (define (star-indent line)
+   \"Returns the number of spaces until the first
+    star (`*') in the input, or #f if the first
+    non-space character is not a star.\"
+   (match-bind \"^( *)\\*.*$\" line (_ spaces)
+               (string-length spaces)
+               #f))
+@end example
+"
+    (define (match-bindings m re vars nvars)
+      (let lp ((in vars) (i 0) (out '()))
+        (syntax-case in ()
+          (()
+           (if (not (= i nvars))
+               (error "bad number of bindings to match-bind" i nvars)
+               (reverse out)))
+          ((v . v*)
+           (lp #'v* (1+ i)
+               (with-syntax ((i i) (m m))
+                 (cons #'(v (match-substring m i)) out))))
+          (v (and (identifier? #'v) (<= i nvars))
+             (reverse
+              (cons (with-syntax
+                        (((init ...)
+                          (map (lambda (x)
+                                 (with-syntax ((m m) (i (+ i x)))
+                                   #'(match-substring m i)))
+                               (iota (- nvars i)))))
+                      #'(v (list init ...)))
+                    out))))))
+    (syntax-case x ()
+      ((_ regex str vars consequent)
+       #'(match-bind regex str vars consequent (if #f #f)))
+      ((_ regex str vars consequent alternate)
+       (string? (syntax->datum #'regex))
+       (let ((m #'m))
+         (with-syntax ((m m)
+                       (((var val) ...)
+                        (match-bindings m (memoize-re (syntax->datum #'regex))
+                                        #'vars
+                                        ;; 1+ for the match:0 binding
+                                        (1+ (regex:count
+                                             (syntax->datum #'regex))))))
+           #'(let* ((m (regexp-exec (memoize-re regex) str)))
+               (if m
+                   (let ((var val) ...)
+                     consequent)
+                   alternate))))))))
+
+(define-macro (make-state-parser states initial)
+  `(lambda (port)
+     (let lp ((state ',initial)
+              (c (read-char port))
+              (out '())
+              (accum '()))
+       (case state
+         ((*eof*) (reverse out))
+         ,@(map
+            (lambda (desc)
+              (let ((name (car desc))
+                    (cont (cadr desc))
+                    (cases (map
+                            (lambda (kase)
+                              (let ((condition (car kase))
+                                    (new-state (cdr kase)))
+                                (cond
+                                 ((not (symbol? new-state))
+                                  (error "invalid new-state in spec" new-state))
+                                 ((number? condition)
+                                  `((= (length accum) ,condition) ',new-state))
+                                 ((list? condition)
+                                  `((memv c ',condition) ',new-state))
+                                 (else
+                                  `(,condition ',new-state)))))
+                            (cddr desc))))
+                `((,name)
+                  (let ((new-state (cond ((eof-object? c) '*eof*) ,@cases))
+                        (cont ,cont))
+                    (if (eq? state new-state)
+                        (lp state (read-char port) out (cons c accum))
+                        (lp new-state c
+                            (if cont
+                                (cons (cont (reverse accum)) out)
+                                out)
+                            '()))))))
+            states)
+         (else (error "invalid state" state (reverse out) (reverse accum)))))))
+
+(define (make-item-list subst)
+  (map
+   (lambda (item)
+     (cond ((procedure? item) item)
+           ((string? item) (lambda (match) item))
+           (else (error "internal error" item))))
+   (call-with-input-string
+    subst
+    (make-state-parser
+     ((string
+       list->string
+       ((#\\) . quote-head)
+       ((#\$) . variable-head)
+       (else . string))
+      (quote-head
+       #f
+       (0 . quote-head)
+       (else . quote))
+      (quote
+       list->string
+       (0 . quote)
+       ((#\\) . quote-head)
+       ((#\$) . variable-head)
+       (else . string))
+      (variable-head
+       #f
+       (0 . variable-head)
+       ((#\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9) . variable)
+       (else . error))
+      (variable
+       (lambda (l)
+         (let ((i (string->number (list->string l))))
+           (lambda (match)
+             (or (match:substring match i) ""))))
+       ((#\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9) . variable)
+       ((#\\) . quote-head)
+       ((#\$) . variable-head)
+       (else . string)))
+     string))))
+
+(define (s/// pat subst)
+  "Make a procedure that performs perl-like regular expression
+search-and-replace on an input string.
+
+The regular expression pattern @var{pat} is in the standard regular
+expression syntax accepted by @code{make-regexp}. The substitution
+string is very similar to perl's @code{s///} operator. Backreferences
+are indicated with a dollar sign (@samp{$}), and characters can be
+escaped with the backslash.
+
+@code{s///} returns a procedure of one argument, the input string to be
+matched. If the string matches the pattern, it will be returned with the
+first matching segment replaced as per the substitution string.
+Otherwise the string will be returned unmodified.
+
+Here are some examples:
+
+@example
+ ((s/// \"foo\" \"bar\") \"foo bar baz qux foo\")
+    @result{} \"bar bar baz qux foo\"
+
+ ((s/// \"zag\" \"bar\") \"foo bar baz qux foo\")
+    @result{} \"foo bar baz qux foo\"
+
+ ((s/// \"(f(o+)) (zag)?\" \"$1 $2 $3\")
+  \"foo bar baz qux foo\")
+    @result{} \"foo oo bar baz qux foo\"
+@end example
+"
+  (let ((re (make-regexp pat))
+        (substers `(,match:prefix
+                    ,@(make-item-list subst)
+                    ,match:suffix)))
+    (lambda (string)
+      (let ((match (regexp-exec re string)))
+        (if match
+            (apply string-append (map (lambda (p) (p match)) substers))
+            string)))))
+
+(define (s///g pat subst)
+  "Make a procedure that performs perl-like global search-and-replace on
+an input string.
+
+The @var{pat} and @var{subst} arguments are as in the non-global
+@code{s///}. @xref{match-bind s///,,s///}, for more information.
+
+@code{s///g} differs from @code{s///} in that it does a global search
+and replace, not stopping at the first match.
+"
+  (let ((re (make-regexp pat))
+        (items `(pre
+                 ,@(make-item-list subst)
+                 post)))
+    (lambda (string)
+      (apply regexp-substitute/global #f re string items))))
+
+#+end_src
+
+** mod-lisp.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/mod-lisp.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2011, 2012 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Web server implementation for mod-lisp.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/mod-lisp.scm :mkdirp yes
+(define-module (tekuti mod-lisp)
+  #:use-module (ice-9 rdelim)
+  #:use-module (system repl error-handling)
+  #:use-module (srfi srfi-9)
+  #:use-module (ice-9 poll)
+  #:use-module (rnrs bytevectors)
+  #:use-module (web http)
+  #:use-module (web request)
+  #:use-module (web response)
+  #:use-module (web server))
+
+
+(define *mod-lisp-headers* (make-hash-table))
+
+(define (define-mod-lisp-header! name parser)
+  (hashq-set! *mod-lisp-headers* (string->symbol (string-downcase name))
+              (cons name parser)))
+
+(define-mod-lisp-header! "server-protocol" parse-http-version)
+(define-mod-lisp-header! "method" parse-http-method)
+(define-mod-lisp-header! "url" parse-request-uri)
+(define-mod-lisp-header! "server-ip-addr" identity)
+(define-mod-lisp-header! "server-ip-port" string->number)
+(define-mod-lisp-header! "remote-ip-addr" identity)
+(define-mod-lisp-header! "remote-ip-port" string->number)
+(define-mod-lisp-header! "server-id" identity)
+(define-mod-lisp-header! "server-ip-addr" identity)
+(define-mod-lisp-header! "server-baseversion" identity)
+(define-mod-lisp-header! "modlisp-version" identity)
+(define-mod-lisp-header! "modlisp-major-version" string->number)
+
+(define (lookup-mod-lisp-header sym)
+  (hashq-ref *mod-lisp-headers* sym))
+
+(define (parse-mod-lisp-header hpair val)
+  ((cdr hpair) val))
+
+(define (read-headers/mod-lisp socket)
+  (define (read-line*)
+    (let ((line (read-line socket)))
+      (if (eof-object? line)
+          (error "unexpected eof")
+          line)))
+  (let lp ((headers '()) (meta '()))
+    (let ((k (string->symbol (string-downcase (read-line*)))))
+      (if (eq? k 'end)
+          (values (reverse! headers) (reverse! meta))
+          (let ((mod-lisp-header (lookup-mod-lisp-header k))
+                (v (read-line*)))
+            (if mod-lisp-header
+                (lp headers
+                    (acons k (parse-mod-lisp-header mod-lisp-header v) meta))
+                (lp (acons k (parse-header k v) headers)
+                    meta)))))))
+
+(define (read-request/mod-lisp port)
+  ;; See the note in (web request) regarding chars, bytes, and strings
+  ;; for more notes on charsets.
+  (set-port-encoding! port "ISO-8859-1")
+  (call-with-values (lambda () (read-headers/mod-lisp port))
+    (lambda (headers meta)
+      (build-request
+       (assq-ref meta 'url)
+       #:method (assq-ref meta 'method)
+       #:version (assq-ref meta 'server-protocol)
+       #:headers headers
+       #:meta meta
+       #:port port))))
+
+;; Note, we only write HTTP headers here, not mod-lisp headers.
+(define (write-header/mod-lisp name val port)
+  (display (header->string name) port)
+  (newline port)
+  ((header-writer name) val port)
+  (newline port))
+
+(define (write-response-line/mod-lisp code phrase port)
+  (display "Status" port)
+  (newline port)
+  (display (string-append (number->string code) " " phrase) port)
+  (newline port))
+
+(define (write-headers/mod-lisp headers port)
+  (for-each
+   (lambda (pair)
+     (write-header/mod-lisp (car pair) (cdr pair) port))
+   headers))
+
+(define (write-response/mod-lisp r port)
+  (write-response-line/mod-lisp (response-code r)
+                                (response-reason-phrase r) port)
+  (write-headers/mod-lisp (response-headers r) port)
+  (display "end" port) (newline port)
+  (if (eq? port (response-port r))
+      r
+      (build-response #:version (response-version r)
+                      #:code (response-code r)
+                      #:reason-phrase (response-reason-phrase r)
+                      #:headers (response-headers r)
+                      #:port port)))
+
+(define (make-default-socket family addr port)
+  (let ((sock (socket PF_INET SOCK_STREAM 0)))
+    (setsockopt sock SOL_SOCKET SO_REUSEADDR 1)
+    (bind sock family addr port)
+    sock))
+
+(define-record-type <mod-lisp-server>
+  (make-mod-lisp-server socket poll-idx poll-set)
+  mod-lisp-server?
+  (socket mod-lisp-socket)
+  (poll-idx mod-lisp-poll-idx set-mod-lisp-poll-idx!)
+  (poll-set mod-lisp-poll-set))
+
+(define *error-events* (logior POLLHUP POLLERR))
+(define *read-events* POLLIN)
+(define *events* (logior *error-events* *read-events*))
+
+;; -> server
+(define* (mod-lisp-open #:key
+                    (host #f)
+                    (family AF_INET)
+                    (addr (if host
+                              (inet-pton family host)
+                              INADDR_LOOPBACK))
+                    (port 8080)
+                    (socket (make-default-socket family addr port)))
+  (listen socket 128)
+  (sigaction SIGPIPE SIG_IGN)
+  (let ((poll-set (make-empty-poll-set)))
+    (poll-set-add! poll-set socket *events*)
+    (make-mod-lisp-server socket 0 poll-set)))
+
+;; -> (client request body | #f #f #f)
+(define (mod-lisp-read server)
+  (let* ((poll-set (mod-lisp-poll-set server)))
+    (let lp ((idx (mod-lisp-poll-idx server)))
+      (let ((revents (poll-set-revents poll-set idx)))
+        (cond
+         ((zero? idx)
+          ;; The server socket, and the end of our downward loop.
+          (cond
+           ((zero? revents)
+            ;; No client ready, and no error; poll and loop.
+            (poll poll-set)
+            (lp (1- (poll-set-nfds poll-set))))
+           ((not (zero? (logand revents *error-events*)))
+            ;; An error.
+            (throw 'interrupt))
+           (else
+            ;; A new client. Add to set, poll, and loop.
+            ;;
+            ;; FIXME: preserve meta-info.
+            (let ((client (accept (poll-set-port poll-set idx))))
+              ;; Fully buffered.
+              (setvbuf (car client) _IOFBF)
+              ;; From "HOP, A Fast Server for the Diffuse Web", Serrano.
+              (setsockopt (car client) SOL_SOCKET SO_SNDBUF (* 12 1024))
+              (poll-set-add! poll-set (car client) *events*)
+              (poll poll-set)
+              (lp (1- (poll-set-nfds poll-set)))))))
+         ((zero? revents)
+          ;; Nothing on this port.
+          (lp (1- idx)))
+         ;; Otherwise, a client socket with some activity on
+         ;; it. Remove it from the poll set.
+         (else
+          (let ((port (poll-set-remove! poll-set idx)))
+            (cond
+             ((eof-object? (peek-char port))
+              ;; EOF.
+              (close-port port)
+              (lp (1- idx)))
+             (else
+              ;; Otherwise, try to read a request from this port.
+              ;; Record the next index.
+              (set-mod-lisp-poll-idx! server (1- idx))
+              (with-throw-handler
+               #t
+               (lambda ()
+                 (let ((req (read-request/mod-lisp port)))
+                   (values port
+                           req
+                           (read-request-body req))))
+               (lambda (k . args)
+                 (false-if-exception (close-port port)))))))))))))
+
+;; -> unspecified values
+(define (mod-lisp-write server client response body)
+  (let ((response (write-response/mod-lisp response client)))
+    (cond
+     ((not body))                       ; pass
+     ((bytevector? body)
+      (write-response-body response body))
+     (else
+      (error "Expected a bytevector for body" body)))
+    (close-port (response-port response))))
+
+;; -> unspecified values
+(define (mod-lisp-close server)
+  (let ((poll-set (mod-lisp-poll-set server)))
+    (let lp ((n (poll-set-nfds poll-set)))
+      (if (positive? n)
+          (begin
+            (close-port (poll-set-remove! poll-set (1- n)))
+            (lp (1- n)))))))
+
+(define-server-impl mod-lisp
+  mod-lisp-open
+  mod-lisp-read
+  mod-lisp-write
+  mod-lisp-close)
+
+#+end_src
+
+** page.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/page.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2011, 2012, 2019, 2021, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; This is the main script that will launch tekuti.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/page.scm :mkdirp yes
+(define-module (tekuti page)
+  #:use-module (ice-9 match)
+  #:use-module (tekuti config)
+  #:use-module (tekuti util)
+  #:use-module (tekuti git)
+  #:use-module (tekuti post)
+  #:use-module (tekuti comment)
+  #:use-module (tekuti classifier)
+  #:use-module (web uri)
+  #:use-module (web request)
+  #:use-module (tekuti request)
+  #:use-module (tekuti page-helpers)
+  #:use-module ((srfi srfi-1) #:select (fold append-map))
+  #:use-module (srfi srfi-34)
+  #:use-module (srfi srfi-19)
+  #:export (page-admin
+            page-admin-posts
+            page-admin-post
+            page-admin-new-post
+            page-admin-modify-post
+            page-admin-delete-post
+            page-admin-delete-comment
+            page-admin-changes
+            page-admin-change
+            page-admin-revert-change
+            page-index
+            page-show-post
+            page-show-static
+            page-new-comment
+            page-archives
+            page-show-tags
+            page-show-tag
+            page-debug
+            page-search
+            page-feed-atom
+            page-debug
+            page-not-found))
+
+;; Encoded twice, so as to form a single path-component.
+(define (make-post-key . parts)
+  (string-downcase (uri-encode (encode-and-join-uri-path parts))))
+
+(define (not-implemented request . args)
+  (respond `((section
+              (h2 "Not yet implemented")
+              (p "Path handler not yet implemented: "
+                 ,(request-relative-path-str request))))
+           #:status 500))
+
+(define (page-admin request body index)
+  (with-authentication
+   request
+   (lambda ()
+     ;; here we need to be giving a dashboard view instead of this
+     (define (post-links n)
+       (map (lambda (post)
+              `(li ,(admin-post-link post)))
+            (latest-posts index #:allow-unpublished? #t #:limit n)))
+     (define (recent-changes n)
+       (map (lambda (rev)
+              `(li ,(rellink `("admin" "changes" ,(car rev))
+                             (caddr rev))))
+            (git-rev-list "refs/heads/master" n)))
+     (respond `((section
+                 (h2 "new post")
+                 (aside (@ (class "meta"))
+                        (h3 "posts " ,(rellink '("admin" "posts") ">>"))
+                        (ul ,@(post-links 5))
+                        (h3 "changes" ,(rellink '("admin" "changes") ">>"))
+                        (ul ,@(recent-changes 5)))
+                 ,(post-editing-form #f index)))))))
+
+(define (page-admin-posts request body index)
+  (with-authentication
+   request
+   (lambda ()
+     (define (post-headers)
+       (map (lambda (post)
+              `(h3 ,(admin-post-link post)))
+            (latest-posts index #:allow-unpublished? #t #:limit -1)))
+     (respond `((section
+                 (h2 "all your posts are belong to tekuti")
+                 ,@(post-headers)))))))
+
+(define (page-admin-post request body index key)
+  (with-authentication
+   request
+   (lambda ()
+     (let ((post (post-from-key index key #:allow-unpublished? #t)))
+       (respond `((section
+                   (h2 ,(post-title post))
+                   ,(post-editing-form post index))))))))
+
+(define (page-admin-new-post request body index)
+  (with-authentication
+   request
+   (lambda ()
+     (let ((post (make-new-post (request-form-data request body))))
+       (respond `((section (h2 "redirecting...")))
+                #:redirect (admin-post-url post))))))
+
+(define (page-admin-modify-post request body index key)
+  (with-authentication
+   request
+   (lambda ()
+     (let ((post (modify-post key (request-form-data request body))))
+       (respond `((section (h2 "redirecting...")))
+                #:redirect (admin-post-url post))))))
+
+(define (page-admin-delete-post request body index key)
+  (with-authentication
+   request
+   (lambda ()
+     (delete-post (post-from-key index key #:allow-unpublished? #t))
+     (respond `((section (h2 "redirecting...")))
+              #:redirect (relurl `("admin"))))))
+
+(define (page-admin-delete-comment request body index key comment-id)
+  (with-authentication
+   request
+   (lambda ()
+     (let ((post (post-from-key index key #:allow-unpublished? #t)))
+       (delete-comment post comment-id)
+       (respond `((section (h2 "redirecting...")))
+                #:redirect (admin-post-url post))))))
+
+(define (page-admin-changes request body index)
+  (with-authentication
+   request
+   (lambda ()
+     (let ((revs (git-rev-list (request-query-ref request "start"
+                                                  "refs/heads/master")
+                               10)))
+       (respond `((section
+                   (h2 "recent changes")
+                   ,@(map (lambda (rev)
+                            `(div (h3 ,(rellink `("admin" "changes" ,(car rev))
+                                                (caddr rev)))
+                                  ,(timestamp->rfc822-date (cadr rev))))
+                          revs)
+                   (h3 ,(rellink '("admin" "changes")
+                                 "more"
+                                 #:query
+                                 `(("start" . ,(caar (last-pair revs)))))))))))))
+
+(define (page-admin-change request body index sha1)
+  (with-authentication
+   request
+   (lambda ()
+     (let ((commit (parse-commit sha1)))
+       (respond
+        `((section
+           (h2 ,(assq-ref commit 'message))
+           (p "Committed on "
+              ,(timestamp->rfc822-date
+                ;; needlessly goes to git again...
+                (commit-utc-timestamp sha1)))
+           (pre ,(git "diff-tree" "-M" "-p" sha1))
+           (form (@ (action ,(relurl `("admin" "revert-change" ,sha1)))
+                    (method "POST"))
+                 (input (@ (type "submit") (value "Undo this change")))))))))))
+
+
+(define (page-admin-revert-change request body index sha1)
+  (with-authentication
+   request
+   (lambda ()
+     (let ((new-master (git-revert "refs/heads/master" sha1)))
+       (respond `((section (h2 "Change reverted")))
+                #:redirect (relurl '("admin")))))))
+
+(define (page-index request body index)
+  (respond (map (lambda (post) (show-post post index #f))
+                (latest-posts index #:limit 10))
+           #:etag (assq-ref index 'master)
+           #:title *title*
+           #:subtitle *subtitle*
+           #:keywords (map car (top-tags index 10))
+           #:nav-items (main-nav-items request index)))
+
+(define (page-show-post request body index year month day post)
+  (cond
+   ((post-from-key index (make-post-key year month day post)
+                   #:allow-draft? #t)
+    => (lambda (post)
+         (define title
+           (format #f "~a — ~a" (post-title post) *title*))
+         (define subtitle
+           (format #f "article: ~a" (post-title post)))
+         (respond (list (show-post post index #t))
+                  #:title title
+                  #:etag (assq-ref index 'master)
+                  #:subtitle subtitle
+                  #:keywords (post-tags post)
+                  #:nav-items (main-nav-items request index))))
+   (else
+    (page-not-found request body index))))
+
+(define (page-show-static request body index)
+  (cond
+   ((static-post-from-key index
+                          (apply make-post-key (request-relative-path request)))
+    => (lambda (post)
+         (define title
+           (format #f "~a — ~a" (post-title post) *title*))
+         (respond (list (show-static-post post index))
+                  #:title title
+                  #:etag (assq-ref index 'master)
+                  #:subtitle (post-title post)
+                  #:keywords (post-tags post)
+                  #:nav-items (main-nav-items request index))))
+   (else
+    (page-not-found request body index))))
+
+(define (page-new-comment request body index year month day name)
+  (let ((data (request-form-data request body)))
+    (cond
+     ((post-from-key index (make-post-key year month day name))
+      => (lambda (post)
+           (let ((comment (parse-new-comment data)))
+             (cond
+              ((not (post-comments-open? post))
+               (respond `((section
+                           (h2 "Comments closed")
+                           (p "Comments on this post are closed.")))))
+              ((bad-new-comment-post? data)
+               => (lambda (reason)
+                    (respond
+                     `((section
+                        (h2 "Error processing comment")
+                        (p "Bad post data: " ,(pk reason)))))))
+              ((comment-is-bogus? index comment)
+               (respond `((section
+                           (h2 "Error processing comment")
+                           (p "Comment appears to be bogus; ignoring.")
+                           (p "I'm testing out a new automated bogus "
+                              "comment detector.  If you feel your comment "
+                              "was caught unfairly, tweet it to me or send "
+                              "it by email.  Or press back and reword it.")
+                           (p "If you are a spammer, note that I fixed "
+                              "the comment renderer to properly add "
+                              (tt "rel='external nofollow'") " on all "
+                              "links in comments.  Go take a look at any "
+                              "comment with a link to see for yourself.  "
+                              "Trying to linkbomb this site probably won't "
+                              "give you any link juice so it's not worth "
+                              "the trouble to either one of us :)")))))
+              (else
+               (make-new-comment (post-key post) (post-title post) comment)
+               ;; nb: at this point, `post' is out-of-date
+               (respond `((section
+                           (h2 "Comment posted")
+                           (p "Thanks.")))
+                        #:redirect (post-url post #:fragment "comments")
+                        #:title "comment posted"))))))
+     (else
+      (page-not-found request body index)))))
+
+;; fixme exception handling for input
+(define (page-archives request body index year month day)
+  (let ((year (and=> year string->number))
+        (month (and=> month string->number))
+        (day (and=> day string->number)))
+    (let ((start (make-date 0 0 0 0 (or day 1) (or month 1) (or year 1980) 0)))
+      (define too-early?
+        (compose1 (date-before? start) post-timestamp))
+      (define early-enough?
+        (if year
+            (compose1 (date-before?
+                       (cond (day (date-increment start #:day 1))
+                             (month (date-increment start #:month 1))
+                             (else (date-increment start #:year 1))))
+                      post-timestamp)
+            (lambda (post) #t)))
+      (define (make-date-header post)
+        (lambda (x) #f))
+      (define subtitle
+        (cond
+         (day (format #f "articles written in ~A/~A/~A." year month day))
+         (month (format #f "articles written in ~A/~A." year month))
+         (year (format #f "articles written in ~A." year))
+         (else (format #f "all articles."))))
+
+      (let lp ((posts (latest-posts index #:limit -1)))
+        (cond ((or (null? posts) (too-early? (car posts)))
+               (respond `((section
+                           (h2 "No posts found")
+                           (p "No posts were found in the specified period.")))
+                        #:status 404
+                        #:title *title*))
+              ((early-enough? (car posts))
+               (let lp ((posts posts) (new-header (make-date-header #t)) (out '()))
+                 (cond
+                  ((or (null? posts) (too-early? (car posts)))
+                   (respond (reverse out)
+                            #:title (string-append "archives: " *title*)
+                            #:etag (assq-ref index 'master)
+                            #:subtitle subtitle))
+                  ((new-header (car posts))
+                   => (lambda (sxml)
+                        (lp (cdr posts) (make-date-header (car posts))
+                            (cons (post-link (car posts)) (append sxml out)))))
+                  (else
+                   (lp (cdr posts) new-header (cons `(p ,(post-link (car posts))) out))))))
+              (else (lp (cdr posts))))))))
+
+(define (page-search request body index)
+  (let* ((string (or (assoc-ref (request-form-data request body) "string") ""))
+         (posts (find-posts-matching string index)))
+    (define subtitle
+      (format #f "articles containing the string ~S." string))
+    (respond `((section
+                (h2 "search results: \"" ,string "\"")
+                ,@(if (null? posts)
+                      `((p "No posts matched your search string."))
+                      (map (lambda (post)
+                             `(p ,(post-link post)))
+                           posts))))
+             #:status (if (null? posts) 404 200)
+             #:subtitle subtitle)))
+
+(define (page-show-tags request body index)
+  (define subtitle
+    "a clickable tag cloud of all tags used in published articles.")
+  (respond `((section
+              (@ (id "tag-cloud"))
+              (h2 "all tags")
+              ,@(tag-cloud (top-tags index 200))))
+           #:etag (assq-ref index 'master)
+           #:title (string-append "all tags — " *title*)
+           #:subtitle subtitle))
+
+(define (page-show-tag request body index tag)
+  (let* ((tags (assq-ref index 'tags))
+         (posts (map (lambda (key)
+                       (post-from-key index key))
+                     (hash-ref tags tag '()))))
+    (match posts
+      (()
+       (respond `((section
+                   (h2 "Unknown tag " ,tag)
+                   (p "No posts were found tagged as \"" ,tag "\".")))
+                 #:status 404))
+      (_
+       (define subtitle
+         (format #f "articles with the tag ~S." tag))
+       (respond `((section
+                   (h2 "posts tagged \"" ,tag "\" ("
+                       ,(rellink '("feed" "atom") "feed"
+                                 #:query `(("with" . ,tag)))
+                       ")")
+                   ,@(map (lambda (post) `(p ,(post-link post)))
+                          posts)
+                   ,(related-tag-cloud tag index)))
+                #:etag (assq-ref index 'master)
+                #:title (string-append "posts tagged \"" tag "\"")
+                #:subtitle subtitle
+                ;; Could add related tags.
+                #:keywords (list tag))))))
+
+(define (page-debug request body index)
+  (respond `((section
+              (h2 "hello world!")
+              (table
+               (tr (th "header") (th "value"))
+               ,@(map (lambda (pair)
+                        `(tr (td (tt ,(with-output-to-string
+                                        (lambda () (display (car pair))))))
+                             (td (tt ,(with-output-to-string
+                                        (lambda ()
+                                          (write (cdr pair))))))))
+                      (request-headers request)))))
+           #:title "debug"))
+
+(define (page-not-found request body index)
+  (respond `((section
+              (h2 "Page not found")
+              (p "Unknown path: "
+                 ,(request-relative-path-str (pk 'not-found request)))))
+           #:status 404))
+
+
+(define (atom-feed-from-posts request body index posts)
+  (let ((last-modified (and (pair? posts)
+                            (post-timestamp (car posts)))))
+    (cond
+     ((let ((since (request-if-modified-since request)))
+        (and since last-modified (>= (date->timestamp since) last-modified)))
+      (respond #f #:status 304
+               #:last-modified (timestamp->date last-modified)
+               #:etag (assq-ref index 'master)))
+     (else
+      (respond #f
+               #:last-modified (and=> last-modified timestamp->date)
+               #:doctype #f
+               #:content-type 'application/atom+xml
+               #:etag (assq-ref index 'master)
+               #:sxml (append (atom-header last-modified)
+                              (map
+                               (lambda (post)
+                                 (atom-entry post))
+                               posts)))))))
+
+(define (page-feed-atom request body index)
+  (let ((with (request-query-ref-all request "with"))
+        (without (request-query-ref-all request "without"))
+        (tags (assq-ref index 'tags)))
+    (define include?
+      (if (pair? with)
+          (fold (lambda (tag cont)
+                  (let ((posts (hash-ref tags tag '())))
+                    (if (pair? posts)
+                        (lambda (post)
+                          (or (member (post-key post) posts)
+                              (cont post)))
+                        cont)))
+                (lambda (post) #f)
+                with)
+          (lambda (post) #t)))
+    (define exclude?
+      (fold (lambda (tag cont)
+              (let ((posts (hash-ref tags tag '())))
+                (lambda (post)
+                  (or (member (post-key post) posts)
+                      (cont post)))))
+            (lambda (post) #f)
+            without))
+
+    (atom-feed-from-posts
+     request body index
+     (latest-posts index
+                   #:filter
+                   (lambda (post)
+                     (and (include? post) (not (exclude? post))))
+                   #:limit 10))))
+
+#+end_src
+
+** page-helpers.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/page-helpers.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012, 2014, 2019, 2021, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Helper bits, mostly verbose-like SXML stuff.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/page-helpers.scm :mkdirp yes
+(define-module (tekuti page-helpers)
+  #:use-module (ice-9 format)
+  #:use-module (ice-9 match)
+  #:use-module (sxml simple)
+  #:use-module (web uri)
+  #:use-module (web http)
+  #:use-module (web response)
+  #:use-module (tekuti base64)
+  #:use-module (tekuti config)
+  #:use-module (tekuti util)
+  #:use-module (tekuti git)
+  #:use-module (tekuti post)
+  #:use-module (tekuti tags)
+  #:use-module (tekuti comment)
+  #:use-module (tekuti request)
+  #:use-module (tekuti template)
+  #:use-module ((srfi srfi-1) #:select (append-map))
+  #:use-module (srfi srfi-19)
+  #:export (respond
+            relurl rellink
+            post-url
+            post-editing-form
+            sidebar-ul top-tags tag-cloud
+            main-nav-items related-posts-section related-tag-cloud
+            post-link admin-post-url admin-post-link
+            show-post show-static-post with-authentication
+            find-posts-matching
+            atom-header atom-entry))
+
+(define html-doctype "<!doctype html>\n")
+
+(define-syntax build-headers
+  (syntax-rules ()
+    ((_ k v-exp rest ...)
+     (let ((v v-exp))
+       (let ((tail (build-headers rest ...)))
+         (if v
+             (acons 'k v tail)
+             tail))))
+    ((_ tail)
+     tail)))
+
+(define (ensure-uri x)
+  (cond
+   ((uri? x) x)
+   ((string? x)
+    (build-uri *public-scheme* #:host *public-host* #:port *public-port*
+               #:path x))
+   ((list? x)
+    (ensure-uri (relurl x)))
+   (else (error "can't turn into a uri" x))))
+
+(define (ensure-uri-reference x)
+  (cond
+   ((uri? x) x)
+   ((string? x)
+    (if (defined? 'build-uri-reference)
+        (build-uri-reference #:path x)
+        ;; Absolute URIs on older Guile.
+        (ensure-uri x)))
+   ((list? x)
+    (ensure-uri-reference (relurl x)))
+   (else (error "can't turn into a uri" x))))
+
+(define-syntax-rule (define-tag-set pred tag ...)
+  (define pred
+    (let ((set (make-hash-table)))
+      (hashq-set! set 'tag #t) ...
+      (lambda (t) (hashq-ref set t)))))
+
+(define-tag-set void-element?
+  area base br col embed hr img input link meta param source track wbr)
+(define-tag-set template-element?
+  template)
+(define-tag-set raw-text-element?
+  script style)
+(define-tag-set escapable-raw-text-element?
+  textarea title)
+(define (foreign-element? tag)
+  (string-index (symbol->string tag) #\:))
+;; Otherwise it's a normal element.
+
+(define (make-char-quotator char-encoding)
+  (let ((bad-chars (list->char-set (map car char-encoding))))
+
+    ;; Check to see if str contains one of the characters in charset,
+    ;; from the position i onward. If so, return that character's index.
+    ;; otherwise, return #f
+    (define (index-cset str i charset)
+      (string-index str charset i))
+
+    ;; The body of the function
+    (lambda (str port)
+      (let ((bad-pos (index-cset str 0 bad-chars)))
+        (if (not bad-pos)
+            (display str port)          ; str had all good chars
+            (let loop ((from 0) (to bad-pos))
+              (cond
+               ((>= from (string-length str)) *unspecified*)
+               ((not to)
+                (display (substring str from (string-length str)) port))
+               (else
+                (let ((quoted-char
+                       (cdr (assv (string-ref str to) char-encoding)))
+                      (new-to
+                       (index-cset str (+ 1 to) bad-chars)))
+                  (if (< from to)
+                      (display (substring str from to) port))
+                  (display quoted-char port)
+                  (loop (1+ to) new-to))))))))))
+
+(define (attribute-value-empty? value)
+  (string-null? value))
+
+(define attribute-value-needs-quotes-chars
+  (char-set-union (string->char-set "\"'=<>`") char-set:whitespace))
+(define (attribute-value-needs-quotes? value)
+  (or (string-null? value)
+      (string-index value attribute-value-needs-quotes-chars)))
+
+(define print-attribute-value/quoted
+  (make-char-quotator
+   '((#\< . "&lt;") (#\> . "&gt;") (#\& . "&amp;") (#\" . "&quot;"))))
+
+(define print-text/quoted
+  (make-char-quotator
+   '((#\< . "&lt;") (#\> . "&gt;") (#\& . "&amp;"))))
+
+(define* (shtml->html tree #:optional (port (current-output-port)))
+  "Serialize the shtml tree @var{tree} as HTML. The output will be written
+to the current output port, unless the optional argument @var{port} is
+present."
+  (define (attribute->html attr value)
+    (display attr port)
+    (unless (attribute-value-empty? value)
+      (display #\= port)
+      (cond
+       ((attribute-value-needs-quotes? value)
+        (display #\" port)
+        (print-attribute-value/quoted value port)
+        (display #\" port))
+       (else
+        (display value port)))))
+
+  (define (element->html tag attrs body)
+    (display #\< port)
+    (display tag port)
+    (let lp ((attrs attrs))
+      (match attrs
+        (() #t)
+        ((((? symbol? attr) val) . attrs)
+         (display #\space port)
+         (attribute->html attr val)
+         (lp attrs))))
+
+    (cond
+     ((and (null? body) (foreign-element? tag))
+      (display " />" port))
+     ((void-element? tag)
+      (unless (null? body) (error "unexpected body for void element"))
+      (display #\> port))
+     (else
+      (display #\> port)
+      (cond
+       ((raw-text-element? tag)
+        (let ((body (string-concatenate body)))
+          (let ((needle (string-append "</" (symbol->string tag))))
+            (let lp ((idx 0))
+              (let ((idx (string-contains-ci body needle idx)))
+                (when idx
+                  (let ((idx (+ idx (string-length needle))))
+                    (let ((ch (and (< idx (string-length body))
+                                   (string-ref body idx))))
+                      (when (and ch (string-index "\t\n\f\r >/" ch))
+                        (error "raw text element body contains end tag"
+                               needle body)))
+                    (lp idx))))))
+          (display body port)))
+       ((escapable-raw-text-element? tag)
+        (for-each
+         (lambda (str)
+           (unless (string? str)
+             (error "bad escapable raw text content" str))
+           (print-text/quoted str port))
+         body))
+       (else
+        (for-each ->html body)))
+      (display "</" port)
+      (display tag port)
+      (display ">" port))))
+
+  (define (->html tree)
+    (match tree
+      (((? symbol? tag) ('@ . attrs) . body)
+       (element->html tag attrs body))
+      (((? symbol? tag) . body)
+       (element->html tag '() body))
+      ((_ . _)
+       (error "nodelists unsupported" tree))
+      ((or #f #t ()) #f)
+      ((? string?)
+       (print-text/quoted tree port))
+      ((? procedure?)
+       (with-output-to-port port tree))
+      ((? number?)
+       (display tree port))
+      (tree
+       (error "unexpected shtml" tree))))
+
+  (match tree
+    (('html . _)
+     (->html tree))))
+
+(define* (respond #:optional body #:key
+                  redirect
+                  (status (if redirect 302 200))
+                  (title *title*)
+                  (subtitle *subtitle*)
+                  (keywords '())
+                  (nav-items '())
+                  last-modified
+                  etag
+                  (doctype html-doctype)
+                  (content-type-params '((charset . "utf-8")))
+                  (content-type 'text/html)
+                  (extra-headers '())
+                  (serialize
+                   (match content-type
+                     ('text/html shtml->html)
+                     ('application/atom+xml sxml->xml)))
+                  (sxml (and body
+                             (templatize #:title title
+                                         #:subtitle subtitle
+                                         #:keywords keywords
+                                         #:nav-items nav-items
+                                         #:body body))))
+  (values (build-response
+           #:code status
+           #:headers (build-headers
+                      location (and=> redirect ensure-uri-reference)
+                      last-modified last-modified
+                      content-type (cons content-type content-type-params)
+                      date (current-date)
+                      etag (if (string? etag) (cons etag #t) etag)
+                      extra-headers))
+          (and sxml
+               (lambda (port)
+                 (if doctype (display doctype port))
+                 (serialize sxml port)))))
+
+(define (unparse-www-form-urlencoded alist)
+  (string-join (map (lambda (pair)
+                      (if (cdr pair)
+                          (string-append (uri-encode (car pair))
+                                         "="
+                                         (uri-encode (cdr pair)))
+                          (uri-encode (car pair))))
+                    alist)
+               "&"))
+
+(define* (relative-url uri path-components #:key query fragment)
+  (uri->string
+   (build-uri (uri-scheme uri)
+              #:userinfo (uri-userinfo uri) #:host (uri-host uri)
+              #:port (uri-port uri)
+              #:path (encode-and-join-uri-path
+                      (append (split-and-decode-uri-path (uri-path uri))
+                              path-components))
+              #:query (and=> query unparse-www-form-urlencoded)
+              #:fragment fragment)))
+
+(define* (relative-link uri path-components text #:key query fragment)
+  `(a (@ (href ,(relative-url uri path-components #:query query
+                              #:fragment fragment)))
+      ,@text))
+
+(define* (relative-path base path-components #:key query fragment)
+  (let ((path (encode-and-join-uri-path (append base path-components)))
+        (query (and=> query unparse-www-form-urlencoded)))
+    (if query
+        (if fragment
+            (string-append "/" path "?" query "#" fragment)
+            (string-append "/" path "?" query))
+        (if fragment
+            (string-append "/" path "#" fragment)
+            (string-append "/" path)))))
+
+(define* (relative-path-link base path-components text #:key query fragment)
+  `(a (@ (href ,(relative-path base path-components #:query query
+                               #:fragment fragment)))
+      ,text))
+
+(define* (relurl path-components #:key query fragment)
+  (relative-path *public-path-base* path-components #:query query
+                 #:fragment fragment))
+
+(define* (rellink path-components text #:key query fragment)
+  (relative-path-link *public-path-base* path-components text #:query query
+                      #:fragment fragment))
+
+(define (post-editing-form post index)
+  `(section
+    (form (@ (method "POST")
+             (action ,(if post
+                          (relurl `("admin" "modify-post" ,(post-key post)))
+                          (relurl '("admin" "new-post")))))
+          (p (input (@ (name "title") (type "text")
+                       (value ,(if post (post-title post) ""))))
+             (label (@ (for "title")) " <- title"))
+          (p (input (@ (name "tags") (type "text")
+                       (value ,(if post
+                                   (string-join (post-tags post) ", ")
+                                   ""))))
+             (label (@ (for "tags")) " <- tags, comma-separated"))
+          (p (input (@ (name "date") (type "text")
+                       (value ,(if (and=> post post-public?)
+                                   (timestamp->rfc822-date (post-timestamp post))
+                                   ""))))
+             (label (@ (for "date")) " <- date (empty == now)"))
+          (p (input (@ (name "comments") (type "checkbox")
+                       ,@(if (or (not post) (post-comments-open? post))
+                             `((checked "checked")) '())))
+             (label (@ (for "comments")) " comments open?"))
+          (p (input (@ (name "comments-closed-date") (type "text")
+                       (value ,(or (and=> (and=> post
+                                                 post-comments-closed-timestamp)
+                                          timestamp->rfc822-date)
+                                   ""))))
+             (label (@ (for "comments-closed-date"))
+                    " <- close comments on date (empty == in "
+                    ,(floor/ *comments-open-window* (* 24 60 60))
+                    " days)"))
+          (div (textarea (@ (name "body") (rows "120") (cols "80"))
+                         ,(if post (post-raw-content post) "")))
+          (p (label (input (@ (type "radio") (name "status") (value "private")
+                              ,@(if (or (not post) (post-private? post))
+                                    '((checked "checked"))
+                                    '())))
+                    "private (only visible to admin)") (br)
+             (label (input (@ (type "radio") (name "status") (value "draft")
+                              ,@(if (and post (post-draft? post))
+                                    '((checked "checked"))
+                                    '())))
+                    "draft (only accessible via "
+                    ,(if post
+                         `(a (@ (href ,(post-url post)))
+                             ,(post-url post))
+                         "direct link")
+                    ")") (br)
+             (label (input (@ (type "radio") (name "status") (value "static")
+                              ,@(if (and post (post-static? post))
+                                    '((checked "checked"))
+                                    '())))
+                    "static (accessible via "
+                    ,(if (and post (post-static? post))
+                         `(a (@ (href ,(post-url post)))
+                             ,(post-url post))
+                         "static link")
+                    ")") (br)
+             (label (input (@ (type "radio") (name "status") (value "publish")
+                              ,@(if (and post (post-public? post))
+                                    '((checked "checked"))
+                                    '())))
+                    "public"))
+          (p (input (@ (type "submit")
+                       (value ,(if post "modify post" "new post"))))))
+    ,@(if post
+          `((form (@ (method "POST")
+                     (action ,(relurl `("admin" "delete-post" ,(post-key post)))))
+                  (p (input (@ (type "submit") (value "delete post")))))
+            ,@(let ((l (comments-sxml-content-edit post)))
+                (if (null? l) l
+                    `((section
+                       (h2 "comments")
+                       (ol (@ (class "commentlist")) ,@l)))))
+            (h2 "preview")
+            ,(show-post post index #f))
+          '())))
+
+(define (sidebar-ul body)
+  `(nav (@ (id "menu"))
+        (ul ,@body)))
+
+(define (admin-post-url post)
+  (relurl `("admin" "posts" ,(post-key post))))
+
+(define (admin-post-link post)
+  `(a (@ (href ,(admin-post-url post))) ,(post-title post)))
+
+(define* (post-url post #:key fragment)
+  (define path-tail (split-and-decode-uri-path (uri-decode (post-key post))))
+  (relative-path *public-path-base*
+                 (if (post-static? post)
+                     path-tail
+                     (cons "archives" path-tail))
+                 #:fragment fragment))
+
+(define* (post-link post #:key fragment)
+  `(a (@ (href ,(post-url post #:fragment fragment)))
+      ,(post-title post)))
+
+(define (comment-form post author email url comment)
+  `(section
+    (h3 (label (@ (for "comment")) "Leave a Reply"))
+    (form
+     (@ (action ,(post-url post)) (method "POST"))
+     (p (label (input (@ (type "text") (name "author") (value ,author)
+                         (size "22")))
+               " " (small "Name")))
+     (p (label (input (@ (type "text") (name "email") (value ,email)
+                         (size "22")))
+               " " (small "Mail (will not be published)")))
+     (p (label (input (@ (type "text") (name "url") (value ,url) (size "22")))
+               " " (small "Website")))
+     (p (label (input (@ (type "text") (name "x") (value "") (size "22")))
+               " " (small "What's a number between 34 and 42?")))
+                                        ;(p (small "allowed tags: "))
+     (p (textarea (@ (name "comment") (id "comment") (cols "65") (rows "10"))
+                  ,comment))
+     (p (input (@ (name "submit") (type "submit") (id "submit")
+                  (value "Submit Comment")))))))
+
+(define (comments-sxml-content-edit post)
+  (append-map
+   (lambda (comment)
+     (let ((id (assq-ref comment 'key)))
+       `(,(comment-sxml-content comment)
+         (form (@ (method "POST")
+                   (action ,(relurl `("admin" "delete-comment"
+                                      ,(post-key post) ,id))))
+                (input (@ (type "submit") (name "delete") (value "delete")))))))
+   (post-comments post)))
+
+(define (post-sxml-comments post)
+  (let ((comments (post-comments post))
+        (comments-open? (post-comments-open? post)))
+    (define (n-comments-header)
+      (and (or (not (null? comments)) comments-open?)
+           `(h3 (@ (id "comments"))
+                ,(let ((len (length comments)))
+                   (case len
+                     ((0) "No responses")
+                     ((1) "One response")
+                     (else (format #f "~d responses" len)))))))
+    `(section
+      ,@(or (and=> (n-comments-header) list) '())
+      ,@(let ((l (map comment-sxml-content comments)))
+          (if (null? l) l
+              `((ol (@ (class "commentlist")) ,@l))))
+      ,(if (not comments-open?)
+           `(p (@ (id "nocomments")) "Comments are closed.")
+           (comment-form post "" "" "" "")))))
+
+(define (tag-link tagname)
+  (rellink `("tags" ,tagname) tagname))
+
+(define (show-post post index standalone?)
+  `(article
+    (h2 (@ (class "storytitle")) ,(post-link post))
+    (aside (@ (class "meta"))
+           (div (@ (class "post-date"))
+                ,(post-readable-date post))
+           (ul (@ (class "post-tags"))
+               ,@(map (lambda (tag) `(li ,(tag-link tag)))
+                      (post-tags post))))
+    ,(post-sxml-content post)
+    ,@(if standalone?
+          (list (related-posts-section post index))
+          '())
+    ,(if standalone?
+         (post-sxml-comments post)
+         `(footer
+           (@ (class "feedback"))
+           (a (@ (href ,(post-url post #:fragment "comments")))
+              "(" ,(post-n-comments post) ")")))))
+
+(define (show-static-post post index)
+  `(article
+    (h2 (@ (class "storytitle")) ,(post-title post))
+    (aside (@ (class "meta"))
+           (ul (@ (class "post-tags"))
+               ,@(map (lambda (tag) `(li ,(tag-link tag)))
+                      (post-tags post))))
+    ,(post-sxml-content post)
+    ,(related-posts-section post index)))
+
+(define (top-tags index n)
+  (let ((hash (assq-ref index 'tags)))
+    (if hash
+        (dsu-sort
+         (take-max
+          (dsu-sort
+           (hash-fold (lambda (k v seed) (acons k (length v) seed))
+                      '() hash)
+           cdr >) n)
+         car string<?)
+        '())))
+
+(define (tag-cloud tags)
+  (define (determine-sizes counts)
+    (let ((maxcount (if (null? counts) '() (apply max counts))))
+      (map (lambda (x)
+             (floor (+ 80 (* 120 (/ x maxcount)))))
+           counts)))
+  (list-intersperse
+   (map (lambda (name size)
+          `(a (@ (href ,(relurl `("tags" ,name)))
+                 (rel "tag")
+                 (style ,(format #f "font-size: ~d%" size)))
+              ,name))
+        (map car tags)
+        (determine-sizes (map cdr tags)))
+   " "))
+
+(define feed-icon-size (number->string 24))
+(define feed-icon
+  #vu8(60 115 118 103 32 120 109 108 110 115 61 34 104 116 116 112 58 47 47 119 119 119 46 119 51 46 111 114 103 47 50 48 48 48 47 115 118 103 34 32 104 101 105 103 104 116 61 34 50 52 34 32 118 105 101 119 66 111 120 61 34 48 32 45 57 54 48 32 57 54 48 32 57 54 48 34 32 119 105 100 116 104 61 34 50 52 34 62 60 112 97 116 104 32 100 61 34 77 50 48 48 45 49 50 48 113 45 51 51 32 48 45 53 54 46 53 45 50 51 46 53 84 49 50 48 45 50 48 48 113 48 45 51 51 32 50 51 46 53 45 53 54 46 53 84 50 48 48 45 50 56 48 113 51 51 32 48 32 53 54 46 53 32 50 51 46 53 84 50 56 48 45 50 48 48 113 48 32 51 51 45 50 51 46 53 32 53 54 46 53 84 50 48 48 45 49 50 48 90 109 52 56 48 32 48 113 48 45 49 49 55 45 52 52 45 50 49 56 46 53 84 53 49 54 45 53 49 54 113 45 55 54 45 55 54 45 49 55 55 46 53 45 49 50 48 84 49 50 48 45 54 56 48 118 45 49 50 48 113 49 52 50 32 48 32 50 54 53 32 53 51 116 50 49 54 32 49 52 54 113 57 51 32 57 51 32 49 52 54 32 50 49 54 116 53 51 32 50 54 53 72 54 56 48 90 109 45 50 52 48 32 48 113 48 45 54 55 45 50 53 45 49 50 52 46 53 84 51 52 54 45 51 52 54 113 45 52 52 45 52 52 45 49 48 49 46 53 45 54 57 84 49 50 48 45 52 52 48 118 45 49 50 48 113 57 50 32 48 32 49 55 49 46 53 32 51 52 46 53 84 52 51 49 45 52 51 49 113 54 48 32 54 48 32 57 52 46 53 32 49 51 57 46 53 84 53 54 48 45 49 50 48 72 52 52 48 90 34 47 62 60 47 115 118 103 62))
+(define inline-feed-icon
+  (format #f "data:image/svg+xml;base64,~a" (base64-encode feed-icon)))
+
+(define (main-nav-items request index)
+  (list `(a (@ (href ,(relurl '("feed" "atom"))))
+            "subscribe "
+            (img (@ (src ,inline-feed-icon)
+                    (alt "[feed]")
+                    (width ,feed-icon-size)
+                    (height ,feed-icon-size))))
+        `(form (@ (method "POST")
+                  (action ,(relurl '("search"))))
+               (label "search "
+                      (input (@ (name "string") (type "text") (size "10")
+                                (value "")))))
+        (rellink '("tags") "tags")
+        `(div (@ (id "tag-cloud"))
+              ,@(tag-cloud (top-tags index 30)))))
+
+(define (related-posts-section post index)
+  `(section (@ (class "related-posts"))
+            ,@(match (take-max (compute-related-posts post index) 6)
+                (() '())
+                (posts
+                 `((h2 "related articles")
+                   (ul ,@(map (lambda (post-and-tags)
+                                `(li (@ (style "margin-top: 5px"))
+                                     ,(post-link (car post-and-tags))))
+                              posts)))))))
+
+(define (related-tag-cloud tag index)
+  `(div (@ (id "tag-cloud"))
+        (h2 "related tags")
+        ,@(tag-cloud (compute-related-tags tag index))))
+
+(define (find-posts-matching string index)
+  (let ((master (assq-ref index 'master)))
+    (dsu-sort
+     (filter
+      identity
+      (match-lines (or (false-if-git-error
+                        ;; dunno why git errors sometimes here...
+                        (git "grep" "-l" "-F" string master "--" "*/content"))
+                       "")
+                   ":(.+)/content$" (_ key)
+                   (post-from-key index key)))
+     post-timestamp
+     >)))
+
+(define (with-authentication request thunk)
+  (if (request-authenticated? request)
+      (thunk)
+      (let ((header (parse-header 'www-authenticate "Basic realm=\"Tekuti\"")))
+        (respond `((p "Authentication required, yo"))
+                 #:status 401
+                 #:extra-headers `((www-authenticate . ,header))))))
+
+(define (atom-header last-modified)
+  (define (relurl . tail)
+    (uri->string (ensure-uri tail)))
+  `(feed
+     (@ (xmlns "http://www.w3.org/2005/Atom") (xml:base ,(relurl)))
+     (title (@ (type "text")) ,*title*)
+     (subtitle (@ (type "text")) ,*subtitle*)
+     ,@(if last-modified
+           `((updated ,(timestamp->atom-date last-modified)))
+           '())
+     (generator (@ (uri "http://wingolog.org/software/tekuti")
+                   (version "what"))
+                "tekuti")
+     (link (@ (rel "alternate") (type "text/html")
+              (href ,(relurl))))
+     (id ,(relurl "feed" "atom"))
+     (link (@ (rel "self") (type "application/atom+xml")
+              (href ,(relurl "feed" "atom"))))))
+
+(define (atom-entry post)
+  (define (relurl . tail)
+    (uri->string (ensure-uri tail)))
+  `(entry
+    (author (name ,*name*) (uri ,(relurl)))
+    (title (@ (type "text")) ,(post-title post))
+    (id ,(apply relurl
+                ;; hack -- should include archives...
+                (split-and-decode-uri-path (uri-decode (post-key post)))))
+    (link (@ (rel "alternate") (type "text/html")
+             (href ,(apply relurl "archives" (split-and-decode-uri-path
+                                              (uri-decode (post-key post)))))))
+    (published ,(timestamp->atom-date (post-timestamp post)))
+    (updated ,(timestamp->atom-date (post-timestamp post)))
+    (content (@ (type "xhtml"))
+             (div (@ (xmlns "http://www.w3.org/1999/xhtml"))
+                  ,(post-sxml-content post)))))
+
+#+end_src
+
+** post.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/post.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2011, 2012, 2014, 2021, 2022, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Posts -- pulling them out of git, and, later, putting them in.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/post.scm :mkdirp yes
+(define-module (tekuti post)
+  #:use-module (ice-9 match)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-19)
+  #:use-module (web uri)
+  #:use-module (tekuti match-bind)
+  #:use-module (tekuti util)
+  #:use-module (tekuti comment)
+  #:use-module (tekuti config)
+  #:use-module (tekuti git)
+  #:use-module (tekuti filters)
+  #:export (post-from-key
+            static-post-from-key
+
+            post-tags post-timestamp post-key
+            post-public? post-draft? post-private? post-static?
+            post-comments-open? post-comments-closed-timestamp
+            post-comments
+            post-sxml-content post-readable-date post-n-comments
+            post-raw-content
+            post-title
+
+            make-new-post modify-post delete-post
+
+            latest-posts
+
+            reindex-posts reindex-posts-by-date))
+
+;;;
+;;; pulling posts out of git
+;;;
+
+(define *post-spec*
+  `((timestamp . ,string->number)
+    (tags . ,(lambda (v) (string-split/trimming v #\,)))
+    (title . ,identity)
+    (format . ,string->symbol)
+    (comments-closed-timestamp . ,(lambda (str)
+                                    (if (string-null? str)
+                                        #f
+                                        (string->number str))))))
+
+(define (post-from-tree encoded-name sha1)
+  (append `((key . ,encoded-name)
+            (sha1 . ,sha1))
+          (match-lines
+           (git "show" (string-append sha1 ":metadata"))
+           "^([^: ]+): +(.*)$" (_ k v)
+           (let* ((k (string->symbol k))
+                  (parse (or (assq-ref *post-spec* k)
+                             identity)))
+             (cons k (parse v))))))
+
+(define (post-from-git master key)
+  (false-if-git-error
+   (let ((pairs (git-ls-subdirs master key)))
+     (and (= (length pairs) 1)
+          (post-from-tree key (cdar pairs))))))
+
+;;;
+;;; pulling posts out of the index
+;;;
+
+(define* (post-from-key index key #:key allow-unpublished? allow-draft?)
+  (let ((post (hash-ref (assq-ref index 'posts) key)))
+    (if (and post
+             (or (post-public? post)
+                 (and (post-draft? post) allow-draft?)
+                 allow-unpublished?))
+        post
+        #f)))
+
+(define (static-post-from-key index key)
+  (let ((post (hash-ref (assq-ref index 'posts) key)))
+    (pk 'static-post-from-key index key)
+    (if (and post (post-static? post))
+        post
+        #f)))
+
+;;;
+;;; accessors
+;;;
+
+(define (post-public? post-alist)
+  (equal? (assq-ref post-alist 'status) "publish"))
+
+(define (post-draft? post-alist)
+  (equal? (assq-ref post-alist 'status) "draft"))
+
+(define (post-private? post-alist)
+  (equal? (assq-ref post-alist 'status) "private"))
+
+(define (post-static? post-alist)
+  (equal? (assq-ref post-alist 'status) "static"))
+
+(define (post-timestamp post-alist)
+  (assq-ref post-alist 'timestamp))
+
+(define (post-tags post-alist)
+  (or (assq-ref post-alist 'tags) '()))
+
+(define (post-key post)
+  (assq-ref post 'key))
+
+(define (post-title post)
+  (assq-ref post 'title))
+
+(define (post-comments-open? post)
+  (and (equal? (assq-ref post 'comment_status) "open")
+       (cond
+        ((post-comments-closed-timestamp post)
+         => (lambda (at-timestamp)
+              (< (time-second (current-time)) at-timestamp)))
+        (else #t))))
+
+(define (post-comments-closed-timestamp post)
+  (assq-ref post 'comments-closed-timestamp))
+
+(define (post-raw-content post)
+  (git "show" (string-append (assq-ref post 'sha1) ":content")))
+
+(define (post-sxml-content post)
+  (let ((format (or (assq-ref post 'format) 'wordpress))
+        (raw (post-raw-content post)))
+    (catch #t
+           (lambda ()
+             (case format
+               ((wordpress) (wordpress->sxml raw))
+               ((marxdown) (marxdown->sxml raw))
+               (else `(pre ,raw))))
+           (lambda args
+             `(pre ,(bad-user-submitted-marxdown? raw))))))
+
+(define (post-readable-date post)
+  (let ((date (time-utc->date
+               (make-time time-utc 0 (post-timestamp post)))))
+    (date->string date "~e ~B ~Y ~l:~M ~p")))
+
+(define (post-comments post)
+  (dsu-sort
+   (map (lambda (pair)
+          (blob->comment (car pair) (cadr pair)))
+        (git-ls-tree (string-append (assq-ref post 'sha1) ":comments") #f))
+   comment-timestamp
+   <))
+
+(define (post-n-comments post)
+  (length (git-ls-tree (string-append (assq-ref post 'sha1) ":comments") #f)))
+
+(define (munge-post old-key parsed)
+  (let ((metadata (with-output-to-blob
+                   (for-each
+                    (lambda (k)
+                      (cond
+                       ((assq-ref parsed k)
+                        => (lambda (v) (format #t "~a: ~a\n" k v)))))
+                    '(timestamp tags status title name comment_status
+                                comments-closed-timestamp format))))
+        (content (with-output-to-blob (display (assq-ref parsed 'body))))
+        (key (assq-ref parsed 'key))
+        (message (format #f "~a: \"~a\""
+                         (if old-key "post modified" "new post")
+                         (assq-ref parsed 'title))))
+    (define (maybe-rename ops)
+      (if (and old-key (not (equal? old-key key)))
+          (cons `(rename () (,old-key ,key)) ops)
+          ops))
+    (define (maybe-clear ops)
+      (if old-key
+          (append `((delete (,key) ("content"))
+                    (delete (,key) ("metadata")))
+                  ops)
+          ops))
+    (let ((ops (maybe-rename
+                (maybe-clear
+                 `((create (,key) ("metadata" ,metadata blob))
+                   (create (,key) ("content" ,content blob)))))))
+      (post-from-git
+       (git-update-ref "refs/heads/master"
+                       (lambda (master)
+                         (git-commit-tree (munge-tree master ops)
+                                          master message #f))
+                       5)
+       key))))
+
+(define space-to-dash (s///g "[ .]" "-"))
+(define remove-extraneous (s///g "[^a-z0-9-]+" ""))
+(define collapse (s///g "-+" "-"))
+
+(define (title->name title)
+  (collapse (remove-extraneous (space-to-dash (string-downcase title)))))
+
+;; some verification necessary...
+(define (parse-post-data post-data)
+  (let ((title (assoc-ref post-data "title"))
+        (body (assoc-ref post-data "body"))
+        (tags (assoc-ref post-data "tags"))
+        (status (assoc-ref post-data "status"))
+        (comments-open? (assoc-ref post-data "comments"))
+        (date-str (assoc-ref post-data "date"))
+        (comments-closed-date-str (assoc-ref post-data "comments-closed-date")))
+    (let* ((timestamp (if (string-null? date-str)
+                          (time-second (current-time))
+                          (rfc822-date->timestamp date-str)))
+           (comments-closed-timestamp
+            (if (string-null? comments-closed-date-str)
+                (if (post-public? (acons 'status status '()))
+                    (+ *comments-open-window* timestamp)
+                    #f)
+                (rfc822-date->timestamp comments-closed-date-str)))
+           (name (title->name title)))
+      `((title . ,title)
+        (body . ,body)
+        (tags . ,tags)
+        (status . ,status)
+        (comment_status . ,(if comments-open? "open" "closed"))
+        (comments-closed-timestamp . ,comments-closed-timestamp)
+        (timestamp . ,timestamp)
+        (name . ,name)
+        (format . marxdown)
+        (key . ,(string-downcase
+                 (uri-encode
+                  (if (equal? status "static")
+                      (uri-encode name)
+                      (string-append (date->string (timestamp->date timestamp)
+                                                   "~Y/~m/~d/")
+                                     (uri-encode name))))))))))
+
+(define (make-new-post post-data)
+  (munge-post #f (parse-post-data post-data)))
+
+(define (modify-post old-key post-data)
+  (munge-post old-key (parse-post-data post-data)))
+
+(define (delete-post post)
+  (let ((message (format #f "~a: \"~a\"" "post deleted" (post-title post))))
+    (git-update-ref "refs/heads/master"
+                  (lambda (master)
+                    (git-commit-tree
+                     (munge-tree1 master 'delete '() `(,(post-key post)))
+                     master message #f))
+                  5)))
+
+(define* (latest-posts index #:key allow-unpublished?
+                       (filter identity) (limit 10))
+  (filter-mapn
+   (lambda (key)
+     (and=> (post-from-key index key #:allow-unpublished? allow-unpublished?)
+            (lambda (post) (and (filter post) post))))
+   (assq-ref index 'posts-by-date)
+   limit))
+
+(define (reindex-posts old-index index)
+  (let ((old (assq-ref old-index 'posts))
+        (new (make-hash-table)))
+    (for-each
+     (lambda (dent)
+       (let* ((key (car dent))
+              (sha1 (cadr dent))
+              (prev (and (hash-table? old) (hash-ref old key))))
+         (hash-set! new key
+                    (if (and prev (equal? (assq-ref prev 'sha1) sha1))
+                        prev
+                        (begin
+                          (pk 'updated dent)
+                          (post-from-tree key sha1))))))
+     (git-ls-tree (assq-ref index 'master) #f))
+    new))
+
+(define (reindex-posts-by-date old-index index)
+  (map cdr
+       (sort (hash-map->list (lambda (key post)
+                               (cons (post-timestamp post) key))
+                             (assq-ref index 'posts))
+             (lambda (x y)
+               (> (car x) (car y))))))
+
+#+end_src
+
+** request.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/request.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2011, 2012 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; This is the main script that will launch tekuti.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/request.scm :mkdirp yes
+(define-module (tekuti request)
+  #:use-module ((srfi srfi-1) #:select (find-tail filter-map))
+  #:use-module (tekuti match-bind)
+  #:use-module (tekuti util)
+  #:use-module (web uri)
+  #:use-module (web request)
+  #:use-module (rnrs bytevectors)
+  #:use-module (ice-9 binary-ports)
+  #:use-module (ice-9 rdelim)
+  #:use-module (tekuti config)
+  #:use-module (tekuti base64)
+  #:export (request-relative-path
+            request-relative-path-str
+            request-query-ref
+            request-query-ref-all
+            request-path-case
+            request-authenticated?
+            request-form-data))
+
+(define* (parse-www-form-urlencoded str #:optional (charset "utf-8"))
+  (map
+   (lambda (piece)
+     (let ((equals (string-index piece #\=)))
+       (if equals
+           (cons (uri-decode (substring piece 0 equals) #:encoding charset)
+                 (uri-decode (substring piece (1+ equals)) #:encoding charset))
+           (cons (uri-decode piece #:encoding charset) ""))))
+   (string-split str #\&)))
+
+(define (request-relative-path r)
+  (let ((base *private-path-base*)
+        (path (split-and-decode-uri-path (uri-path (request-uri r)))))
+    (let ((tail (list-head-match base path (length base))))
+      (or tail
+          (error "unexpected path" path base)))))
+
+(define (request-relative-path-str r)
+  (encode-and-join-uri-path (request-relative-path r)))
+
+(define (request-query-ref r param default)
+  (let ((q (uri-query (request-uri r))))
+    (cond
+     ((and q (assoc param (parse-www-form-urlencoded q))) => cdr)
+     (else default))))
+
+(define (request-query-ref-all r param)
+  (let ((q (uri-query (request-uri r))))
+    (if q
+        (filter-map (lambda (pair)
+                      (and (equal? (car pair) param)
+                           (cdr pair)))
+                    (parse-www-form-urlencoded q))
+        '())))
+
+(define (decode-string bv charset)
+  (if (string-ci=? charset "utf-8")
+      (utf8->string bv)
+      (let ((p (open-bytevector-input-port bv)))
+        (set-port-encoding! p charset)
+        (read-delimited "" p))))
+
+(define (request-form-data request body)
+  (if (bytevector? body)
+      ;; Since valid application/x-www-form-urlencoded content only has
+      ;; ascii characters, treat the incoming data as ascii (well,
+      ;; latin-1), then use the charset when percent-decoding the
+      ;; content.
+      (request-form-data request (decode-string body "iso-8859-1"))
+      (if (or (not body) (string-null? body))
+          '()
+          (let* ((content-type (request-content-type request))
+                 (charset (or (assoc-ref (cdr content-type) "charset")
+                              "utf-8")))
+            (cond
+             ((equal? (car content-type) 'application/x-www-form-urlencoded)
+              (parse-www-form-urlencoded body charset))
+             (else
+              (error "bad content-type" content-type)))))))
+
+;; danger here, regarding the optional alternate clauses...
+(define (request-authenticated? request)
+  (let ((auth (request-authorization request)))
+    (and auth
+         (match-bind "^([^:]*):(.*)$"
+                     (utf8->string (base64-decode (cdr auth)))
+                     (_ user pass)
+                     (and (equal? user *admin-user*)
+                          (equal? pass *admin-pass*))
+                     #f))))
+
+(define-syntax path-proc-case
+  (lambda (stx)
+    (define (optional-argument? arg)
+      (eqv? (string-ref arg (- (string-length arg) 1)) #\?))
+    (define (required-argument? arg)
+      (eqv? (string-ref arg (- (string-length arg) 1)) #\!))
+    (define (output-argument? arg)
+      (or (optional-argument? arg) (required-argument? arg)))
+    (define (process-clause clause)
+      (syntax-case clause (else)
+        ((else expr ...) clause)
+        (((p ...) proc)
+         (let ((pat (map (lambda (p)
+                           (symbol->string (syntax->datum p)))
+                         #'(p ...))))
+           (cond
+            ((find-tail output-argument? pat)
+             => (lambda (tail)
+                  (let* ((req (find-tail required-argument? tail))
+                         (opt (find-tail optional-argument? tail))
+                         (npat (length pat))
+                         (ntail (length tail))
+                         (nopt (if opt (length opt) 0))
+                         (nreq (if req (- (length req) nopt) 0)))
+                    #`((let ((pathtail (list-head-match '#,pat
+                                                        path-var
+                                                        (- #,npat #,ntail))))
+                         ;;(pk pat npat ntail req opt nopt nreq path pathtail)
+                         (if (and pathtail (>= (length pathtail) #,nreq)
+                                  (<= (length pathtail) (+ #,nreq #,nopt)))
+                             (append
+                              pathtail
+                              (make-list (- (+ #,nreq #,nopt) (length pathtail)) #f))
+                             #f))
+                       => (lambda (outargs)
+                            (lambda args
+                              (apply proc (append args outargs))))))))
+            (else
+             #`((equal? path-var '#,pat) proc)))))))
+    (syntax-case stx ()
+      ((_ path clause ...)
+       (with-syntax (((cond-clause ...) (map process-clause #'(clause ...))))
+         #'(let ((path-var path))
+             (cond cond-clause ...)))))))
+
+(define-syntax request-path-case
+  (syntax-rules ()
+    ((_ request clause ...)
+     (let* ((r request)
+            (method (request-method r)))
+       (path-proc-case
+        (cons (symbol->string
+               (case method
+                 ;; Treat HEAD as GET, for the purposes of dispatching
+                 ;; requests.
+                 ((HEAD) 'GET)
+                 (else method)))
+              (request-relative-path r))
+        clause ...)))))
+
+#+end_src
+
+** tags.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/tags.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Tags, tags, tags
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/tags.scm :mkdirp yes
+(define-module (tekuti tags)
+  #:use-module (tekuti util)
+  #:use-module (web uri)
+  #:use-module (tekuti config)
+  #:use-module (tekuti post)
+  #:use-module (tekuti git)
+  #:use-module ((srfi srfi-1) #:select (filter))
+  #:export (tag-link
+            compute-related-posts compute-related-tags
+            reindex-tags))
+
+(define (tag-link tagname)
+  `(a (@ (href ,(string-append
+                 "/" (encode-and-join-uri-path
+                      (append *public-path-base*
+                              (cons "tags" tagname))))))
+      ,tagname))
+
+(define (compute-tags posts)
+  (let ((hash (make-hash-table)))
+    (for-each
+     (lambda (post)
+       (for-each
+        (lambda (cat)
+          (hash-push! hash cat (post-key post)))
+        (post-tags post)))
+     posts)
+    hash))
+
+(define (compute-related-posts post index)
+  (let ((hash (assq-ref index 'tags)))
+    (if hash
+        (let ((accum (make-hash-table)))
+          (for-each
+           (lambda (tag)
+             (for-each
+              (lambda (key)
+                (if (not (equal? key (post-key post)))
+                    (hash-push! accum key tag)))
+              (or (hash-ref hash tag) '())))
+           (post-tags post))
+          (dsu-sort (dsu-sort
+                     (hash-fold
+                      (lambda (key tags rest)
+                        (acons (post-from-key index key) tags rest))
+                      '() accum)
+                     (lambda (x) (post-timestamp (car x)))
+                     >)
+                    length >))
+        '())))
+
+(define (compute-related-tags tag index)
+  (let ((hash (assq-ref index 'tags)))
+    (if hash
+        (let ((accum (make-hash-table)))
+          (for-each
+           (lambda (key)
+             (for-each
+              (lambda (other-tag)
+                (if (not (equal? other-tag tag))
+                    (hash-push! accum other-tag key)))
+              (post-tags (post-from-key index key))))
+           (or (hash-ref hash tag) '()))
+          (dsu-sort
+           (hash-fold
+            (lambda (tag keys rest)
+              (acons tag (length keys) rest))
+            '() accum)
+           car
+           string<?))
+        '())))
+
+(define (reindex-tags old-index index)
+  (compute-tags (latest-posts index #:limit -1)))
+
+#+end_src
+
+** template.scm
+
+#+preamble
+#+begin_src scheme :tangle ./tekuti/template.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2012, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; This is the main script that will launch tekuti.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/template.scm :mkdirp yes
+(define-module (tekuti template)
+  #:use-module (web uri)
+  #:use-module (tekuti config)
+  #:use-module (tekuti page-helpers)
+  #:export (templatize))
+
+(define* (templatize #:key
+                     (title *title*)
+                     (subtitle *subtitle*)
+                     (body '((p "(missing content?)")))
+                     (keywords '())
+                     (nav-items '()))
+  (define (href . args)
+    `(href ,(string-append "/" (encode-and-join-uri-path
+                                (append *public-path-base* args)))))
+  `(html
+    (@ (lang "en"))
+    (head (title ,title)
+          (meta (@ (name "generator")
+                   (content "tekuti: https://wingolog.org/software/tekuti")))
+          (meta (@ (name "description")
+                   (content ,(format #f "~a: ~a" *title* subtitle))))
+          (meta (@ (name "keywords")
+                   (content ,(string-join keywords ", "))))
+          (meta (@ (name "viewport")
+                   (content "width=device-width, initial-scale=1.0")))
+          ,(if *inline-css*
+               `(style (@ (media "screen")) ,*inline-css*)
+               `(link (@ (rel "stylesheet") (media "screen")
+                         (href ,*css-file*))))
+          (link (@ (rel "alternate")
+                   (type "application/rss+xml")
+                   (title ,*title*)
+                   (href ,(relurl `("feed" "atom"))))))
+    (body
+     (header (@ (id "header"))
+             (h1 (a (@ ,(href "")) ,*title*)))
+     (nav (@ (id "navbar"))
+          (ul ,@(map (lambda (x) `(li ,x))
+                     (append (map (lambda (x)
+                                    `(a (@ (href ,(cdr x))) ,(car x)))
+                                  *navbar-links*)
+                             nav-items))))
+     (main (@ (id "content"))
+           ,@body)
+     (footer
+      (@ (id "footer"))
+      "powered by "
+      (a (@ (href "//wingolog.org/software/tekuti/"))
+         "tekuti")))))
+
+#+end_src
+
+** util.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/util.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2011, 2012, 2014 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; Utility procedures and macros.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/util.scm :mkdirp yes
+(define-module (tekuti util)
+  #:use-module (tekuti match-bind)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-19)
+  #:use-module (web uri)
+  #:export (with-output-to-string* with-input-from-string*
+            expanduser match-lines dbg unwind-protect dsu-sort
+            hash-push! list-has-length? list-head-match mapn filter-mapn
+            take-max read-hash write-hash shell:quote foldn
+            call-with-temp-file emailish? urlish?
+            date-increment date-comparator date-before? date-after? compose1
+            rfc822-date->timestamp timestamp->rfc822-date timestamp->atom-date
+            date->timestamp timestamp->date string-split/trimming
+            list-intersperse with-time-debugging))
+
+(define (with-output-to-string* thunk)
+  (let ((port (open-output-string)))
+    (with-output-to-port port thunk)
+    (let ((str (get-output-string port)))
+      (close-port port)
+      str)))
+
+(define (with-input-from-string* str thunk)
+  (let* ((port (open-input-string str))
+         (res (with-input-from-port port thunk)))
+    (close-port port)
+    res))
+
+(define (emailish? x)
+  (match-bind "^([a-zA-Z0-9._+-]+)@([a-zA-Z0-9-]+\\.)+[a-zA-Z]+$"
+              x (_ . args)
+              x
+              #f))
+
+;; hacky #fragment interpreting...
+(define (urlish? x)
+  (let ((uri (string->uri x)))
+    (and uri
+         (memq (uri-scheme uri) '(#f http https))
+         (uri-host uri)
+         #t)))
+
+;; bad name relative to mapn...
+(define (foldn kons n knil values)
+  (if (null? values)
+      knil
+      (foldn kons n
+             (apply kons knil (list-head values n))
+             (list-tail values n))))
+
+(define-syntax unwind-protect
+  (syntax-rules ()
+    ((_ form cleanup0 cleanups ...)
+     (dynamic-wind (lambda () #t)
+                   (lambda () form)
+                   (lambda () cleanup0 cleanups ...)))))
+
+(define (call-with-temp-file contents proc)
+  (let* ((template (string-copy "/tmp/tekutiXXXXXX"))
+         (tmp (mkstemp! template)))
+    (display contents tmp)
+    (close tmp)
+    (unwind-protect
+     (proc template)
+     (delete-file template))))
+
+(define (shell:quote str)
+  (with-output-to-string*
+    (lambda ()
+      (display #\')
+      (string-for-each (lambda (ch)
+                         (if (eqv? ch #\')
+                             (begin (display #\\) (display #\'))
+                             (display ch)))
+                       str)
+      (display #\'))))
+
+(define (expanduser path)
+  (let ((parts (string-split path #\/)))
+    (if (and (not (string-null? (car parts)))
+             (eqv? (string-ref (car parts) 0) #\~))
+        (let ((user (if (= (string-length (car parts)) 1)
+                        (passwd:name (getpwuid (geteuid)))
+                        (substring (car parts) 1))))
+          (string-join (cons (passwd:dir (getpwnam user)) (cdr parts)) "/"))
+        path)))
+
+(define-syntax match-lines
+  (syntax-rules ()
+    ((_ string pattern bindings expr)
+     (fold
+      (lambda (line seed)
+        (match-bind pattern line bindings
+                    (cons expr seed)
+                    seed))
+      '() (string-split string #\newline)))))
+
+(define (dbg fmt . args)
+  (apply format (current-error-port) fmt args))
+
+(define (dsu-sort list key less)
+  (map cdr
+       (stable-sort (map (lambda (x) (cons (key x) x)) list)
+                    (lambda (x y) (less (car x) (car y))))))
+
+(define (hash-push! h key value)
+  (let ((handle (hash-create-handle! h key '())))
+    (set-cdr! handle (cons value (cdr handle)))))
+
+(define (take-max list n)
+  (if (or (null? list) (zero? n))
+      '()
+      (cons (car list) (take-max (cdr list) (1- n)))))
+
+(define (list-has-length? list len)
+  (cond
+   ((zero? len) (null? list))
+   ((null? list) #f)
+   (else (list-has-length? (cdr list) (1- len)))))
+
+;; returns tail of l2
+(define (list-head-match l1 l2 n)
+  (cond
+   ((zero? n) l2)
+   ((null? l2) #f)
+   ((not (equal? (car l1) (car l2))) #f)
+   (else (list-head-match (cdr l1) (cdr l2) (1- n)))))
+
+(define (mapn proc l nmax)
+  (let lp ((in l) (out '()) (n nmax))
+    (if (or (null? in) (zero? n))
+        (reverse out)
+        (lp (cdr in) (cons (proc (car in)) out) (1- n)))))
+
+(define (filter-mapn proc l nmax)
+  (let lp ((in l) (out '()) (n nmax))
+    (if (or (null? in) (zero? n))
+        (reverse out)
+        (let ((val (proc (car in))))
+          (if val
+              (lp (cdr in) (cons val out) (1- n))
+              (lp (cdr in) out n))
+          ))))
+
+(define (list-intersperse src-l elem)
+  (if (null? src-l) src-l
+      (let loop ((l (cdr src-l)) (dest (cons (car src-l) '())))
+        (if (null? l) (reverse dest)
+            (loop (cdr l) (cons (car l) (cons elem dest)))))))
+
+(define (gettimeofday-diff prev)
+  (let ((now (gettimeofday)))
+   (+ (- (car now) (car prev))
+      (* 1e-6 (- (cdr now) (cdr prev))))))
+
+(define (with-time-debugging* proc)
+  (pk 'start-clock)
+  (let ((start (gettimeofday)))
+    (unwind-protect
+     (proc)
+     (pk 'stop-clock (gettimeofday-diff start)))))
+
+(define-syntax with-time-debugging
+  (syntax-rules ()
+    ((_ form0 forms ...)
+     (with-time-debugging* (lambda () form0 forms ...)))))
+
+(define (memoize1 proc)
+  (let ((old-args #f) (cache #f) (proc proc))
+    (lambda args
+      (if (equal? args old-args)
+          cache
+          (let ((val (apply proc args)))
+            (set! old-args args)
+            (set! cache val)
+            val)))))
+
+(define (write-hash h)
+  (write (hash-fold acons '() h)))
+
+(define (read-hash)
+  (let ((h (make-hash-table)))
+    (for-each (lambda (pair)
+                (hash-set! h (car pair) (cdr pair)))
+              (read))
+    h))
+
+(define* (date-increment date #:key (day 0) (month 0) (year 0))
+  (make-date (date-nanosecond date) (date-second date)
+             (date-minute date) (date-minute date)
+             (+ (date-day date) day) (+ (date-month date) month)
+             (+ (date-year date) year) (date-zone-offset date)))
+
+(define (date-comparator date comp)
+  (let ((this (time-second (date->time-utc date))))
+    (lambda (that)
+      (comp that this))))
+
+(define (date-before? date)
+  (date-comparator date <))
+
+(define (date-after? date)
+  (date-comparator date >))
+
+(define (compose1 proc . procs)
+  (if (null? procs)
+      proc
+      (let ((other (apply compose1 procs)))
+        (lambda (x)
+          (proc (other x))))))
+
+(define (string-split/trimming string delimiter)
+  (map string-trim-both (string-split string delimiter)))
+
+(define (rfc822-date->timestamp str)
+  (+ (time-second (date->time-utc
+                   (string->date str "~a, ~d ~b ~Y ~H:~M:~S GMT")))
+     (date-zone-offset (current-date))))
+
+(define (timestamp->date timestamp)
+  (time-utc->date (make-time time-utc 0 timestamp) 0))
+
+(define (date->timestamp date)
+  (time-second (date->time-utc date)))
+
+(define (timestamp->atom-date timestamp)
+  (date->string (timestamp->date timestamp)
+                "~Y-~m-~dT~H:~M:~SZ"))
+
+(define (timestamp->rfc822-date timestamp)
+  (date->string (timestamp->date timestamp)
+                "~a, ~d ~b ~Y ~H:~M:~S GMT"))
+
+#+end_src
+
+** web.scm
+
+#+name: preamble
+#+begin_src scheme :tangle ./tekuti/web.scm :mkdirp yes
+;; Tekuti
+;; Copyright (C) 2008, 2010, 2011, 2012, 2023 Andy Wingo <wingo at pobox dot com>
+
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 59 Temple Place - Suite 330        Fax:    +1-617-542-2652
+;; Boston, MA  02111-1307,  USA       gnu@gnu.org
+
+;;; Commentary:
+;;
+;; This is the main script that will launch tekuti.
+;;
+;;; Code:
+#+end_src
+
+#+begin_src scheme :tangle ./tekuti/web.scm :mkdirp yes
+(define-module (tekuti web)
+  #:use-module (web server)
+  #:use-module (tekuti cache)
+  #:use-module (tekuti request)
+  #:use-module (tekuti index)
+  #:use-module (tekuti page)
+  #:use-module (tekuti config)
+  #:export (main-loop))
+
+(define (choose-handler request)
+  (request-path-case
+   request
+   ((GET admin) page-admin)
+   ((GET admin posts) page-admin-posts)
+   ((GET admin posts post-key!) page-admin-post)
+   ((POST admin new-post) page-admin-new-post)
+   ;; would be fine to have e.g. (DELETE admin posts posts-key!), but
+   ;; web browsers don't handle that
+   ((POST admin delete-post post-key!) page-admin-delete-post)
+   ((POST admin modify-post post-key!) page-admin-modify-post)
+   ((POST admin delete-comment post-key! comment-id!) page-admin-delete-comment)
+   ((GET admin changes) page-admin-changes)
+   ((GET admin changes sha1!) page-admin-change)
+   ((POST admin revert-change sha1!) page-admin-revert-change)
+   ((GET) page-index)
+   ((GET archives year? month? day?) page-archives)
+   ((GET archives year! month! day! post!) page-show-post)
+   ((POST archives year! month! day! post!) page-new-comment)
+   ((GET feed) page-feed-atom)
+   ((GET feed atom) page-feed-atom)
+   ((POST search) page-search)
+   ((GET tags) page-show-tags)
+   ((GET tags tag!) page-show-tag)
+   ((GET debug) page-debug)
+   (else page-show-static)))
+
+(define (cache-ref index request)
+  (cached-response-and-body (assq-ref index 'cache) request))
+
+(define (cache-set index request response body)
+  (update-index
+   (maybe-reindex index)
+   'cache
+   (lambda (index)
+     (update-cache (assq-ref index 'cache) request response body))))
+
+(define (handler request body index)
+  (let ((index (maybe-reindex index)))
+    (cond
+     ((cache-ref index request)
+      => (lambda (cached)
+           (values (car cached) (cdr cached) index)))
+     (else
+      (call-with-values (lambda ()
+                          ((choose-handler request) request body index))
+        (lambda (response body)
+          (call-with-values (lambda ()
+                              (sanitize-response request response body))
+            (lambda (response body)
+              (let ((index (cache-set index request response body)))
+                (values response body index))))))))))
+
+;; The seemingly useless lambda is to allow for `handler' to be
+;; redefined at runtime.
+(define (main-loop)
+  (run-server (lambda (r b i) (handler r b i))
+              *server-impl*
+              (if (list? *server-impl-args*)
+                  *server-impl-args*
+                  (*server-impl-args*))
+              (read-index)))
+
+#+end_src
+
+* Closing: some notes on tekut's quirks
 
 ** 1. You *must* have a git user config ready
 
@@ -52,3 +5384,4 @@ this thing has 3 =M='s.  It looks like a typo, it should be a typo,
 and if it's not a typo, the dude should've simply left a comment in
 there saying, "triple-M is intentional".  I fixed every occurrence of
 triple-M typo to its proper double-M versions.
+
