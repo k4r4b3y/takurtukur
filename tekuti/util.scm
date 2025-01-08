@@ -160,7 +160,7 @@
 
 (define (filter-mapn proc l nmax)
   (let lp ((in l) (out '()) (n nmax))
-    (if (or (null? in) (zero? n))
+    (if (or (nil? in) (zero? n))
         (reverse out)
         (let ((val (proc (car in))))
           (if val
