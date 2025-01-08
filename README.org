@@ -191,6 +191,9 @@ Tekuti's codebase consists of 20 guile scheme files:
 #+end_src
 
 ** boot.scm
+:PROPERTIES:
+:CUSTOM_ID: file-boot-scm
+:END:
 
 *Preamble:*
 #+name: preamble
@@ -270,6 +273,9 @@ Tekuti's codebase consists of 20 guile scheme files:
 #+end_src
 
 *** boot
+:PROPERTIES:
+:CUSTOM_ID: function-boot
+:END:
 
 Ensures that there is a bare git repo for the user's Tekuti blog.  And
 gets the prgoram enter its [[main-loop]].
@@ -1405,7 +1411,7 @@ gets the prgoram enter its [[main-loop]].
 
 *** ensure-git-repo
 
-This function gets called from [[boot]] function in the [[boot.scm]] file.
+This function gets called from [[#function-boot][boot]] function in the [[#file-boot-scm][boot.scm]] file.
 
 #+begin_src scheme :tangle ./tekuti/git.scm :mkdirp yes
 (define (ensure-git-repo)
