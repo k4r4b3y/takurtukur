@@ -278,7 +278,7 @@ Tekuti's codebase consists of 20 guile scheme files:
 :END:
 
 Ensures that there is a bare git repo for the user's Tekuti blog.  And
-gets the prgoram enter its [[main-loop]].
+gets the prgoram enter its [[#main-loop][main-loop]].
 
 #+begin_src scheme :tangle ./tekuti/boot.scm :mkdirp yes
 (define (boot args)
@@ -1410,6 +1410,9 @@ gets the prgoram enter its [[main-loop]].
 #+end_src
 
 *** ensure-git-repo
+:PROPERTIES:
+:CUSTOM_ID: ensure-git-repo
+:END:
 
 This function gets called from [[#boot][boot]] function in the [[#bootscm][boot.scm]] file.
 
@@ -1509,7 +1512,7 @@ This function gets called from [[#boot][boot]] function in the [[#bootscm][boot.
 *** git-commit-tree
 
 Creates a git commit object out of the given git tree.  The
-[[ensure-git-repo]] function calls this function with a tree object
+[[#ensure-git-repo][ensure-git-repo]] function calls this function with a tree object
 created from the empty string =""= when Tekuti creates the bare repo
 (by default in =~/blog.git=) for the first time.
 
@@ -5386,6 +5389,9 @@ present."
 #+end_src
 
 *** main-loop
+:PROPERTIES:
+:CUSTOM_ID: main-loop
+:END:
 
 #+begin_src scheme :tangle ./tekuti/web.scm :mkdirp yes
 ;; The seemingly useless lambda is to allow for `handler' to be
