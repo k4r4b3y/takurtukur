@@ -87,7 +87,7 @@
                              "<" input-file))
         args))
   (let* ((real-args (trc (redirect-input (prepend-env args))))
-         (pipe (apply open-pipe* OPEN_READ real-args))
+         (pipe (apply open-pipe* OPEN_READ real-args)) ; TODO: open-pipe* gives unbound variable error
          (output (get-string-all pipe))
          (ret (close-pipe pipe)))
     (case (status:exit-val ret)
@@ -128,7 +128,7 @@
           (git "init")
           (git "update-ref" "refs/heads/master"
                (git-commit-tree (string-trim-both (git* '("mktree") #:input ""))
-                                #f "initial commit" #f)))
+                                #f "initial commit" #f))) ;TODO: git-commit-tree is the source of the error
         (chdir d))))
 
 (define (git-ls-tree treeish path)
