@@ -214,10 +214,14 @@
          #:env (if timestamp
                    (list "GIT_COMMITTER_NAME=tekuti"
                          "GIT_COMMITTER_EMAIL=tekuti@example.com"
+			 "GIT_AUTHOR_NAME=tekuti"
+                         "GIT_AUTHOR_EMAIL=tekuti@example.com"
                          (format #f "GIT_COMMITTER_DATE=~a +0100" timestamp)
                          (format #f "GIT_AUTHOR_DATE=~a +0100" timestamp))
                    (list "GIT_COMMITTER_NAME=tekuti"
-                         "GIT_COMMITTER_EMAIL=tekuti@example.com")))))
+                         "GIT_COMMITTER_EMAIL=tekuti@example.com"
+			 "GIT_AUTHOR_NAME=tekuti"
+                         "GIT_AUTHOR_EMAIL=tekuti@example.com")))))
 
 ;;;
 ;;; utilities
