@@ -256,4 +256,3 @@
 (define (timestamp->rfc822-date timestamp)
   (date->string (timestamp->date timestamp)
                 "~a, ~d ~b ~Y ~H:~M:~S GMT"))
-
